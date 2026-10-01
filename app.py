@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 SLSU - Judge Guillermo Eleazar | Facility & Equipment Request System
-Single-file Flask + SQLite application.
+Single-file Flask application.  Database: Supabase (PostgreSQL) when DATABASE_URL is set,
+otherwise a local SQLite file (rfu.db) so you can still test on your own computer.
 
-SETUP
-    pip install flask reportlab
-    python app.py                  -> open http://127.0.0.1:5000
+SETUP (local)
+    pip install -r requirements.txt
+    copy .env.example to .env and put your Supabase connection string in DATABASE_URL
+    python APP_1.py                -> open http://127.0.0.1:5000
+SETUP (Render)  Start command: gunicorn APP_1:app   |  Environment: DATABASE_URL, SECRET_KEY
 
 FIRST LOGIN
     username: admin    password: admin123   (you MUST change it on first login)
@@ -13,12 +16,12 @@ FIRST LOGIN
 
 OPTIONAL ENVIRONMENT VARIABLES
     Equipment: the admin adds all equipment and quantities in the "Equipment Stock" tab.
-    RFU_DB=/path/rfu.db  RFU_ADMIN_PASSWORD=...  HOST=0.0.0.0  PORT=8000
+    DATABASE_URL=postgresql://...  SECRET_KEY=...  RFU_ADMIN_PASSWORD=...  TZ_HOURS=8  (RFU_DB/HOST/PORT for local use)
 For real deployment use HTTPS and a WSGI server, e.g.:  pip install waitress ; waitress-serve --port=8000 app:app
 """
 import os, io, re, sys, json, time, base64, secrets, sqlite3
 from calendar import Calendar
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from flask import (Flask, g, request, session, redirect, url_for, render_template,
                    flash, abort, send_file, jsonify, Response)
 from jinja2 import DictLoader
@@ -28,7 +31,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader, simpleSplit
 
+try:                                    # read variables from a local .env file (ignored when not installed / on Render)
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 BASE = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+USE_PG = bool(DATABASE_URL)
+if USE_PG:
+    import psycopg2, psycopg2.extras
 DB_PATH = os.environ.get("RFU_DB", os.path.join(BASE, "rfu.db"))
 FACILITIES = ["Audio Visual Room (AVR)", "Administration Building Lobby", "Covered Court", "Classroom"]
 OLD_DEFAULTS = [("Sound System", 2), ("Table", 30), ("Chair", 200), ("Microphone", 6), ("Projector", 3)]  # removed automatically once
@@ -38,9 +51,12 @@ LOGOS = {"1": "iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAEAAElEQVR42uydd5xdR
 
 app = Flask(__name__)
 _kf = os.path.join(BASE, "rfu_secret.key")
-if not os.path.exists(_kf):
-    open(_kf, "w").write(secrets.token_hex(32))
-app.secret_key = open(_kf).read().strip()
+if os.environ.get("SECRET_KEY"):
+    app.secret_key = os.environ["SECRET_KEY"]       # set this on Render so logins survive redeploys / multiple workers
+else:
+    if not os.path.exists(_kf):
+        open(_kf, "w").write(secrets.token_hex(32))
+    app.secret_key = open(_kf).read().strip()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 # ------------------------------------------------------------------ database
@@ -57,11 +73,47 @@ CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, request_id INTEGER NOT 
   name TEXT NOT NULL, qty INTEGER NOT NULL);
 """
 
+# PostgreSQL / Supabase version of the same schema (SERIAL ids, case-insensitive equipment names, RLS on)
+SCHEMA_PG = ("CREATE EXTENSION IF NOT EXISTS citext;\n"
+             + SCHEMA.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY").replace("name TEXT PRIMARY KEY COLLATE NOCASE", "name CITEXT PRIMARY KEY")
+             + "".join("ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n" % t for t in ("users", "inventory", "requests", "meta", "items")))
+assert "SERIAL" in SCHEMA_PG and "CITEXT" in SCHEMA_PG and "NOCASE" not in SCHEMA_PG
+
+_NOCASE = re.compile(r"([A-Za-z_][\w.]*)\s*=\s*\?\s+COLLATE\s+NOCASE", re.I)
+def pg_sql(sql):
+    """Translate the app's SQLite-style SQL to PostgreSQL."""
+    sql = _NOCASE.sub(r"LOWER(\1) = LOWER(?)", sql)
+    return sql.replace("%", "%%").replace("?", "%s")
+
+class _Res:
+    def __init__(self, cur, lastrowid=None): self.cur, self.lastrowid = cur, lastrowid
+    def fetchall(self): return self.cur.fetchall()
+    def fetchone(self): return self.cur.fetchone()
+
+class PGConn:
+    """Thin wrapper so the rest of the app can keep using db().execute(sql, params)."""
+    def __init__(self):
+        kw = {} if ("sslmode" in DATABASE_URL or "localhost" in DATABASE_URL or "127.0.0.1" in DATABASE_URL) else {"sslmode": "require"}
+        self.c = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor, connect_timeout=10, **kw)
+    def execute(self, sql, params=()):
+        cur = self.c.cursor(); s_ = pg_sql(sql)
+        ins = bool(re.match(r"\s*INSERT\s+INTO\s+(users|requests|items)\b", s_, re.I))
+        if ins: s_ += " RETURNING id"
+        try: cur.execute(s_, params)
+        except Exception:
+            self.c.rollback(); raise
+        return _Res(cur, cur.fetchone()[0] if ins else None)
+    def commit(self): self.c.commit()
+    def close(self): self.c.close()
+
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
+        if USE_PG:
+            g.db = PGConn()
+        else:
+            g.db = sqlite3.connect(DB_PATH)
+            g.db.row_factory = sqlite3.Row
+            g.db.execute("PRAGMA foreign_keys=ON")
     return g.db
 
 @app.teardown_appcontext
@@ -74,18 +126,32 @@ def q1(sql, *a): return db().execute(sql, a).fetchone()
 def ex(sql, *a):
     c = db().execute(sql, a); db().commit(); return c
 
-def now_s(): return datetime.now().strftime("%Y-%m-%d %H:%M")
+# The school is in the Philippines (UTC+8, no daylight saving). Render servers run on UTC, so use PH time explicitly.
+PH = timezone(timedelta(hours=int(os.environ.get("TZ_HOURS", "8"))))
+def now_dt(): return datetime.now(PH)
+def today_ph(): return now_dt().date()
+def now_s(): return now_dt().strftime("%Y-%m-%d %H:%M")
+
+def _remove_old_defaults():
+    if not q1("SELECT 1 FROM meta WHERE key='defaults_removed'"):     # equipment is now added by the admin only
+        for n, st in OLD_DEFAULTS:
+            ex("DELETE FROM inventory WHERE name=? AND stock=? AND NOT EXISTS (SELECT 1 FROM items WHERE name=? COLLATE NOCASE)", n, st, n)
+        ex("INSERT INTO meta VALUES('defaults_removed','1')")
+
+def _ensure_admin():
+    if not q1("SELECT 1 FROM users WHERE username='admin'"):
+        ex("INSERT INTO users(username,fullname,student_no,pw_hash,role,must_change,created_at) VALUES('admin','GSO Administrator','-',?, 'admin',1,?)",
+           generate_password_hash(os.environ.get("RFU_ADMIN_PASSWORD", "admin123")), now_s())
 
 def init_db():
     with app.app_context():
-        db().executescript(SCHEMA)
-        if not q1("SELECT 1 FROM meta WHERE key='defaults_removed'"):     # equipment is now added by the admin only
-            for n, st in OLD_DEFAULTS:
-                ex("DELETE FROM inventory WHERE name=? AND stock=? AND NOT EXISTS (SELECT 1 FROM items WHERE name=? COLLATE NOCASE)", n, st, n)
-            ex("INSERT INTO meta VALUES('defaults_removed','1')")
-        if not q1("SELECT 1 FROM users WHERE username='admin'"):
-            ex("INSERT INTO users(username,fullname,student_no,pw_hash,role,must_change,created_at) VALUES('admin','GSO Administrator','-',?, 'admin',1,?)",
-               generate_password_hash(os.environ.get("RFU_ADMIN_PASSWORD", "admin123")), now_s())
+        if USE_PG:       # one process creates the tables at a time (several gunicorn workers start together)
+            cur = db().c.cursor(); cur.execute("SELECT pg_advisory_xact_lock(7242026)"); cur.execute(SCHEMA_PG); db().commit()
+        else:
+            db().executescript(SCHEMA)
+        for step in (_remove_old_defaults, _ensure_admin):
+            try: step()
+            except Exception as err: print("init_db note (another worker may have done this already):", err)
 
 # ------------------------------------------------------------------ security helpers
 FAILS = {}
@@ -169,7 +235,7 @@ def api_availability():
     d, t1, t2 = (request.args.get(k, "") for k in ("d", "t1", "t2"))
     ok = parse_slot(d, t1, t2)
     if not ok:      # no slot chosen yet -> show what is booked / out of stock right now
-        n = datetime.now(); d, t1, t2 = n.strftime("%Y-%m-%d"), n.strftime("%H:%M"), (n + timedelta(minutes=1)).strftime("%H:%M")
+        n = now_dt(); d, t1, t2 = n.strftime("%Y-%m-%d"), n.strftime("%H:%M"), (n + timedelta(minutes=1)).strftime("%H:%M")
         if t2 <= t1: t1, t2 = "23:58", "23:59"
         ok = True
     out = {"booked": sorted(booked_facilities(d, t1, t2)) if ok else [], "left": {}}
@@ -290,9 +356,9 @@ def enrich(rows):
     return out
 
 def calendar_ctx():
-    m = request.args.get("m") or date.today().strftime("%Y-%m")
+    m = request.args.get("m") or today_ph().strftime("%Y-%m")
     try: y, mo = int(m[:4]), int(m[5:7]); date(y, mo, 1)
-    except Exception: y, mo = date.today().year, date.today().month
+    except Exception: y, mo = today_ph().year, today_ph().month
     ym = "%04d-%02d" % (y, mo)
     days = {}
     for r in enrich(q("SELECT * FROM requests WHERE status IN ('Pending','Approved') AND substr(event_date,1,7)=? ORDER BY t1", ym)):
@@ -302,7 +368,7 @@ def calendar_ctx():
                 prev="%04d-%02d" % (py, pm), next="%04d-%02d" % (ny, nm))
 
 def student_ctx(tab):
-    ctx = dict(tab=tab, today=date.today().isoformat(), facilities=FACILITIES, v={}, e={}, old_items=[], old_fac=[], summary="",
+    ctx = dict(tab=tab, today=today_ph().isoformat(), facilities=FACILITIES, v={}, e={}, old_items=[], old_fac=[], summary="",
                inv=[r["name"] for r in q("SELECT name FROM inventory ORDER BY name")])
     ctx["mine"] = enrich(q("SELECT * FROM requests WHERE user_id=? ORDER BY id DESC", g.user["id"]))
     if tab == "cal": ctx.update(calendar_ctx())
@@ -351,7 +417,7 @@ def new_request():
     if d:
         try:
             datetime.strptime(d, "%Y-%m-%d")
-            if d < date.today().isoformat(): bad(e, "event_date", "The event date cannot be in the past. Choose today or a later date.")
+            if d < today_ph().isoformat(): bad(e, "event_date", "The event date cannot be in the past. Choose today or a later date.")
         except ValueError: bad(e, "event_date", "Invalid date.")
     for k in ("t1", "t2"):
         if v[k]:
@@ -402,7 +468,7 @@ def new_request():
               VALUES(?,?,?,?,?,?,?,?,?,?,?)""", g.user["id"], v["requester"][:120], v["dept"][:120], v["event"][:160], d, t1, t2,
            v["attendees"], json.dumps(fac), v["head"][:120], now_s())
     rid = c.lastrowid
-    ex("UPDATE requests SET rfu_no=? WHERE id=?", "%d-%04d" % (date.today().year, rid), rid)
+    ex("UPDATE requests SET rfu_no=? WHERE id=?", "%d-%04d" % (today_ph().year, rid), rid)
     for n, qy in valid.items(): ex("INSERT INTO items(request_id,name,qty) VALUES(?,?,?)", rid, n, qy)
     flash("Request submitted! It is now pending admin approval.", "ok")
     return redirect(url_for("dashboard", tab="mine"))
