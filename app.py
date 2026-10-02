@@ -19,7 +19,8 @@ OPTIONAL ENVIRONMENT VARIABLES
     DATABASE_URL=postgresql://...  SECRET_KEY=...  RFU_ADMIN_PASSWORD=...  TZ_HOURS=8  (RFU_DB/HOST/PORT for local use)
 For real deployment use HTTPS and a WSGI server, e.g.:  pip install waitress ; waitress-serve --port=8000 app:app
 """
-import os, io, re, sys, json, time, base64, secrets, sqlite3
+import os, io, re, sys, csv, json, time, base64, secrets, sqlite3
+from xml.sax.saxutils import escape as xml_escape
 from calendar import Calendar, monthrange
 from datetime import datetime, date, timedelta, timezone
 from flask import (Flask, g, request, session, redirect, url_for, render_template,
@@ -27,7 +28,10 @@ from flask import (Flask, g, request, session, redirect, url_for, render_templat
 from jinja2 import DictLoader
 from werkzeug.security import generate_password_hash, check_password_hash
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader, simpleSplit
 
@@ -69,6 +73,8 @@ CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, rfu_no TEXT, user_id
   event TEXT, event_date TEXT, t1 TEXT, t2 TEXT, attendees TEXT, facilities TEXT DEFAULT '[]', head TEXT,
   status TEXT DEFAULT 'Pending', remarks TEXT DEFAULT '', created_at TEXT, returned_at TEXT, return_date TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, request_id INTEGER, kind TEXT,
+  message TEXT NOT NULL, created_at TEXT, read_at TEXT);
 CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
   name TEXT NOT NULL, qty INTEGER NOT NULL);
 """
@@ -76,7 +82,7 @@ CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, request_id INTEGER NOT 
 # PostgreSQL / Supabase version of the same schema (SERIAL ids, case-insensitive equipment names, RLS on)
 SCHEMA_PG = ("CREATE EXTENSION IF NOT EXISTS citext;\n"
              + SCHEMA.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY").replace("name TEXT PRIMARY KEY COLLATE NOCASE", "name CITEXT PRIMARY KEY")
-             + "".join("ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n" % t for t in ("users", "inventory", "requests", "meta", "items")))
+             + "".join("ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n" % t for t in ("users", "inventory", "requests", "meta", "items", "notifications")))
 assert "SERIAL" in SCHEMA_PG and "CITEXT" in SCHEMA_PG and "NOCASE" not in SCHEMA_PG
 
 _NOCASE = re.compile(r"([A-Za-z_][\w.]*)\s*=\s*\?\s+COLLATE\s+NOCASE", re.I)
@@ -132,6 +138,27 @@ def now_dt(): return datetime.now(PH)
 def today_ph(): return now_dt().date()
 def now_s(): return now_dt().strftime("%Y-%m-%d %H:%M")
 
+ICONS = {
+ "menu": '<line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>',
+ "x": '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+ "check": '<polyline points="20 6 9 17 4 12"/>',
+ "new": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/>',
+ "list": '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
+ "cal": '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+ "pending": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+ "approved": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+ "returned": '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>',
+ "disapproved": '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
+ "stock": '<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>',
+ "users": '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+ "report": '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
+ "bell": '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
+ "lock": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+ "out": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+ "eye": '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+ "eyeoff": '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
+}
+
 # ---- 12-hour (AM/PM) display helpers, used by the pages and the PDF
 def t12(t):
     try: return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
@@ -139,6 +166,11 @@ def t12(t):
 def dfmt(d):
     try: return datetime.strptime((d or "")[:10], "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
     except Exception: return d or ""
+def sched(r):
+    """One-line schedule text for reports: 'Oct 10, 2026 9:00 AM - 5:00 PM' or 'Oct 10, 2026 9:00 AM to Oct 11, 2026 5:00 PM'."""
+    rd = r["return_date"] or r["event_date"]
+    if rd == r["event_date"]: return "%s %s - %s" % (dfmt(r["event_date"]), t12(r["t1"]), t12(r["t2"]))
+    return "%s %s to %s %s" % (dfmt(r["event_date"]), t12(r["t1"]), dfmt(rd), t12(r["t2"]))
 def dt12(s_):
     s_ = s_ or ""
     return (dfmt(s_[:10]) + " " + t12(s_[11:16])).strip()
@@ -379,21 +411,132 @@ def calendar_ctx():
     except Exception: y, mo = today_ph().year, today_ph().month
     ym = "%04d-%02d" % (y, mo)
     first, last = ym + "-01", "%s-%02d" % (ym, monthrange(y, mo)[1])
-    days = {}
-    for r in enrich(q("SELECT * FROM requests WHERE status IN ('Pending','Approved') AND event_date<=? AND COALESCE(return_date,event_date)>=? ORDER BY event_date,t1", last, first)):
+    days, ev = {}, {}
+    is_admin = bool(g.user and g.user["role"] == "admin")
+    for r in enrich(q("""SELECT r.*, u.student_no AS u_sn, u.username AS u_user FROM requests r LEFT JOIN users u ON u.id=r.user_id
+                         WHERE r.status IN ('Pending','Approved') AND r.event_date<=? AND COALESCE(r.return_date,r.event_date)>=?
+                         ORDER BY r.event_date, r.t1""", last, first)):
         rd = r["return_date"] or r["event_date"]
+        if is_admin:
+            ev[r["id"]] = dict(no=r["rfu_no"], status=r["badge"], event=r["event"], requester=r["requester"], dept=r["dept"],
+                               student=r.get("u_sn") or "", user=r.get("u_user") or "",
+                               start=dfmt(r["event_date"]) + ", " + t12(r["t1"]), end=dfmt(rd) + ", " + t12(r["t2"]),
+                               attendees=r["attendees"] or "", fac=", ".join(r["fac"]) or "-",
+                               items=", ".join("%s x%d" % (i["name"], i["qty"]) for i in r["its"]) or "-", head=r["head"] or "",
+                               remarks=r["remarks"] or "", filed=dt12(r["created_at"]), returned=dt12(r["returned_at"]) if r["returned_at"] else "",
+                               pdf=url_for("request_pdf", rid=r["id"]), tab="returned" if r["returned_at"] else "approved" if r["status"] == "Approved" else "pending")
         for dd in range(int(max(r["event_date"], first)[8:10]), int(min(rd, last)[8:10]) + 1):
             key = "%s-%02d" % (ym, dd)
             lbl = ("%s %s" % (t12(r["t1"]), r["res"])) if key == r["event_date"] else ("Return %s: %s" % (t12(r["t2"]), r["res"])) if key == rd else ("Ongoing: " + r["res"])
             days.setdefault(dd, []).append(dict(r, lbl=lbl, rd=rd))
     py, pm = (y - 1, 12) if mo == 1 else (y, mo - 1); ny, nm = (y + 1, 1) if mo == 12 else (y, mo + 1)
     return dict(weeks=Calendar(6).monthdayscalendar(y, mo), days=days, title=date(y, mo, 1).strftime("%B %Y"),
-                prev="%04d-%02d" % (py, pm), next="%04d-%02d" % (ny, nm))
+                prev="%04d-%02d" % (py, pm), next="%04d-%02d" % (ny, nm), evdata=ev)
+
+# ---------------------------------------------------------------- monthly report (admin)
+def report_data(ym, by):
+    """All requests received by the GSO in month `ym` (by date filed, or by event date) + summary numbers."""
+    col = "r.event_date" if by == "event" else "r.created_at"
+    rows = enrich(q("SELECT r.*, u.student_no AS u_sn FROM requests r LEFT JOIN users u ON u.id=r.user_id WHERE substr(%s,1,7)=? ORDER BY r.created_at, r.id" % col, ym))
+    st = {"total": len(rows), "approved": 0, "disapproved": 0, "pending": 0, "returned": 0, "not_returned": 0}
+    dept, fac, eq = {}, {}, {}
+    for r in rows:
+        if r["status"] == "Approved":
+            st["approved"] += 1
+            if r["returned_at"]: st["returned"] += 1
+            elif r["its"]: st["not_returned"] += 1
+        elif r["status"] == "Disapproved": st["disapproved"] += 1
+        else: st["pending"] += 1
+        k = (r["dept"] or "-").strip() or "-"; dept.setdefault(k.lower(), [k, 0])[1] += 1
+        for f in r["fac"]: fac[f] = fac.get(f, 0) + 1
+        for i in r["its"]: eq[i["name"]] = eq.get(i["name"], 0) + i["qty"]
+    srt = lambda d: sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+    return dict(rows=rows, st=st, depts=sorted(dept.values(), key=lambda x: (-x[1], x[0])), fac=srt(fac), eq=srt(eq))
+
+def report_args():
+    m = request.args.get("m") or today_ph().strftime("%Y-%m")
+    try: y, mo = int(m[:4]), int(m[5:7]); date(y, mo, 1)
+    except Exception: y, mo = today_ph().year, today_ph().month
+    return y, mo, "%04d-%02d" % (y, mo), ("event" if request.args.get("by") == "event" else "filed")
+
+def report_ctx():
+    y, mo, ym, by = report_args()
+    py, pm = (y - 1, 12) if mo == 1 else (y, mo - 1); ny, nm = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    months = [("%s" % r["ym"], date(int(r["ym"][:4]), int(r["ym"][5:7]), 1).strftime("%B %Y"), r["c"]) for r in
+              q("SELECT substr(created_at,1,7) AS ym, COUNT(*) AS c FROM requests WHERE created_at IS NOT NULL GROUP BY substr(created_at,1,7) ORDER BY substr(created_at,1,7) DESC LIMIT 12")]
+    return dict(rep=report_data(ym, by), ym=ym, by=by, rtitle=date(y, mo, 1).strftime("%B %Y"), rprev="%04d-%02d" % (py, pm), rnext="%04d-%02d" % (ny, nm), months=months)
+
+@app.route("/admin/report.csv")
+@admin_required
+def report_csv():
+    y, mo, ym, by = report_args(); rep = report_data(ym, by)
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["RFU No.", "Date filed", "Requester", "Student no.", "College/Department", "Event", "Start", "Return", "Facilities", "Equipment", "Attendees", "Status", "Remarks", "Returned on"])
+    for r in rep["rows"]:
+        rd = r["return_date"] or r["event_date"]
+        w.writerow([r["rfu_no"], dt12(r["created_at"]), r["requester"], r.get("u_sn") or "", r["dept"], r["event"],
+                    dfmt(r["event_date"]) + " " + t12(r["t1"]), dfmt(rd) + " " + t12(r["t2"]), "; ".join(r["fac"]),
+                    "; ".join("%s x%d" % (i["name"], i["qty"]) for i in r["its"]), r["attendees"] or "", r["badge"], r["remarks"] or "",
+                    dt12(r["returned_at"]) if r["returned_at"] else ""])
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=GSO-report-%s.csv" % ym})
+
+@app.route("/admin/report.pdf")
+@admin_required
+def report_pdf():
+    y, mo, ym, by = report_args(); rep = report_data(ym, by); title = date(y, mo, 1).strftime("%B %Y"); st = rep["st"]
+    ss = getSampleStyleSheet()
+    sm = ParagraphStyle("sm", parent=ss["BodyText"], fontSize=8, leading=10)
+    ctr = ParagraphStyle("ctr", parent=sm, alignment=1, fontSize=9, leading=12)
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=13, leading=16, spaceAfter=2)
+    P = lambda t, style=sm: Paragraph(xml_escape(str(t)), style)
+    lg = lambda n: Image(io.BytesIO(base64.b64decode(LOGOS[n])), 19 * mm, 19 * mm)
+    GREEN = colors.HexColor("#14532d")
+    head = Table([[lg("1"), [Paragraph("Southern Luzon State University - Judge Guillermo Eleazar", h1), Paragraph("General Services Office - Tagkawayan, Quezon", ctr),
+                             Paragraph("<b>MONTHLY REPORT OF FACILITY / EQUIPMENT REQUESTS</b>", ctr), Paragraph("Period: <b>%s</b> (%s)" % (xml_escape(title), "by event date" if by == "event" else "by date filed"), ctr)], lg("2")]],
+                 colWidths=[26 * mm, 217 * mm, 26 * mm]); head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (0, 0), (0, 0), "LEFT"), ("ALIGN", (2, 0), (2, 0), "RIGHT")]))
+    labels = ["Total requests", "Approved", "Disapproved", "Pending", "Returned", "Approved, not yet returned"]
+    vals = [st["total"], st["approved"], st["disapproved"], st["pending"], st["returned"], st["not_returned"]]
+    summ = Table([labels, vals], colWidths=[269 * mm / 6] * 6)
+    summ.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), GREEN), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                              ("FONTSIZE", (0, 0), (-1, 0), 8), ("FONTSIZE", (0, 1), (-1, 1), 16), ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"), ("GRID", (0, 0), (-1, -1), .5, colors.HexColor("#b7d7c4")),
+                              ("TOPPADDING", (0, 1), (-1, 1), 6), ("BOTTOMPADDING", (0, 1), (-1, 1), 6)]))
+    def mini(ttl, pairs, unit):
+        data = [[P(ttl, ParagraphStyle("t", parent=sm, textColor=colors.white, fontName="Helvetica-Bold")), P(unit, ParagraphStyle("t2", parent=sm, textColor=colors.white, fontName="Helvetica-Bold", alignment=2))]]
+        data += [[P(a), P(b, ParagraphStyle("n", parent=sm, alignment=2))] for a, b in pairs[:8]] or [[P("-"), P("")]]
+        t = Table(data, colWidths=[62 * mm, 22 * mm]); t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), GREEN), ("GRID", (0, 0), (-1, -1), .4, colors.HexColor("#c9d6cf")), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); return t
+    trio = Table([[mini("College/Department", [(d[0], d[1]) for d in rep["depts"]], "Requests"), mini("Facility used", rep["fac"], "Times"), mini("Equipment borrowed", rep["eq"], "Qty")]], colWidths=[89.6 * mm] * 3)
+    trio.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    story = [head, Spacer(1, 4 * mm), summ, Spacer(1, 4 * mm), trio, Spacer(1, 5 * mm)]
+    rows = [[P(x, ParagraphStyle("h", parent=sm, textColor=colors.white, fontName="Helvetica-Bold")) for x in ("RFU No.", "Date filed", "Requester / Department", "Event", "Schedule", "Facility / Equipment", "Status")]]
+    for r in rep["rows"]:
+        rows.append([P(r["rfu_no"]), P(dt12(r["created_at"])), P("%s - %s" % (r["requester"], r["dept"])), P(r["event"]), P(sched(r)), P(r["res"]), P(r["badge"] + (" (" + dt12(r["returned_at"]) + ")" if r["returned_at"] else ""))])
+    if len(rows) == 1: story.append(Paragraph("No requests were received for this period.", ss["BodyText"]))
+    else:
+        t = Table(rows, colWidths=[19 * mm, 30 * mm, 44 * mm, 40 * mm, 52 * mm, 53 * mm, 31 * mm], repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), GREEN), ("GRID", (0, 0), (-1, -1), .4, colors.HexColor("#c9d6cf")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f8f5")])])); story.append(t)
+    def foot(c, d):
+        c.setFont("Helvetica", 8); c.setFillColor(colors.grey)
+        c.drawString(14 * mm, 8 * mm, "Generated %s - GSO Facility & Equipment Request System" % dt12(now_s())); c.drawRightString(landscape(A4)[0] - 14 * mm, 8 * mm, "Page %d" % d.page)
+    buf = io.BytesIO(); SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=14 * mm, rightMargin=14 * mm, topMargin=10 * mm, bottomMargin=14 * mm, title="GSO Monthly Report " + title).build(story, onFirstPage=foot, onLaterPages=foot)
+    buf.seek(0); return send_file(buf, mimetype="application/pdf", download_name="GSO-report-%s.pdf" % ym)
+
+# ---------------------------------------------------------------- notifications (students)
+def notify(uid, rid, kind, msg):
+    ex("INSERT INTO notifications(user_id,request_id,kind,message,created_at) VALUES(?,?,?,?,?)", uid, rid, kind, msg, now_s())
+
+@app.route("/notifications/read", methods=["POST"])
+@login_required
+def notifications_read():
+    ex("UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL", now_s(), g.user["id"])
+    return ("", 204)
 
 def student_ctx(tab):
     ctx = dict(tab=tab, today=today_ph().isoformat(), facilities=FACILITIES, v={}, e={}, old_items=[], old_fac=[], summary="",
                inv=[r["name"] for r in q("SELECT name FROM inventory ORDER BY name")])
     ctx["mine"] = enrich(q("SELECT * FROM requests WHERE user_id=? ORDER BY id DESC", g.user["id"]))
+    ctx["notifs"] = [dict(x) for x in q("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 20", g.user["id"])]
+    ctx["unread"] = q1("SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL", g.user["id"])[0]
     if tab == "cal": ctx.update(calendar_ctx())
     return ctx
 
@@ -406,7 +549,7 @@ def home(): return redirect(url_for("dashboard"))
 def dashboard():
     tab = request.args.get("tab", "")
     if g.user["role"] == "admin":
-        tab = tab if tab in ("pending", "approved", "returned", "disapproved", "cal", "stock", "users") else "pending"
+        tab = tab if tab in ("pending", "approved", "returned", "disapproved", "cal", "stock", "users", "report") else "pending"
         cnt = {k: q1(s)[0] for k, s in {
             "pending": "SELECT COUNT(*) FROM requests WHERE status='Pending'",
             "approved": "SELECT COUNT(*) FROM requests WHERE status='Approved' AND returned_at IS NULL",
@@ -421,6 +564,7 @@ def dashboard():
             ctx["inv"] = [dict(r, out=q1("""SELECT COALESCE(SUM(i.qty),0) FROM items i JOIN requests r ON r.id=i.request_id
                  WHERE i.name=? COLLATE NOCASE AND r.status='Approved' AND r.returned_at IS NULL AND (r.event_date||' '||r.t1)<=?""",
                  r["name"], now_s())[0]) for r in q("SELECT * FROM inventory ORDER BY name")]
+        elif tab == "report": ctx.update(report_ctx())
         elif tab == "users": ctx["users"] = q("SELECT * FROM users ORDER BY role, fullname")
         return render_template("admin.html", **ctx)
     tab = tab if tab in ("new", "mine", "cal") else "new"
@@ -517,12 +661,14 @@ def admin_action(rid, action):
                 flash("Cannot approve: only %d %s available for that time." % (l, i["name"]), "err")
                 return redirect(url_for("dashboard", tab="pending"))
         ex("UPDATE requests SET status='Approved', remarks='', returned_at=NULL WHERE id=?", rid); flash("Request approved.", "ok")
+        notify(r["user_id"], rid, "approved", "Your request %s (%s) was APPROVED. You may use the facility/equipment on the schedule you requested." % (r["rfu_no"], r["event"]))
     elif action == "disapprove" and r["returned_at"]:
         flash("This request is already marked as returned, so it can no longer be disapproved.", "err")
     elif action == "disapprove":
         why = request.form.get("remarks", "").strip()
         if not why: flash("Please enter a reason (remarks) for disapproval.", "err"); return redirect(request.referrer or url_for("dashboard"))
         ex("UPDATE requests SET status='Disapproved', remarks=?, returned_at=NULL WHERE id=?", why[:300], rid); flash("Request disapproved.", "ok")
+        notify(r["user_id"], rid, "disapproved", "Your request %s (%s) was DISAPPROVED. Reason: %s" % (r["rfu_no"], r["event"], why[:300]))
     elif action == "returned" and r["status"] == "Approved":
         ex("UPDATE requests SET returned_at=? WHERE id=?", now_s(), rid); flash("Marked as returned. Stock is available again.", "ok")
     else: abort(400)
@@ -550,16 +696,6 @@ def admin_stock_delete():
     else:
         ex("DELETE FROM inventory WHERE name=?", n); flash("%s was removed from the equipment list." % n, "ok")
     return redirect(url_for("dashboard", tab="stock"))
-
-@app.route("/admin/user/<int:uid>/reset", methods=["POST"])
-@admin_required
-def admin_reset_user(uid):
-    u = q1("SELECT * FROM users WHERE id=?", uid)
-    if not u: abort(404)
-    temp = secrets.token_urlsafe(6)
-    ex("UPDATE users SET pw_hash=?, must_change=1 WHERE id=?", generate_password_hash(temp), uid)
-    flash("Temporary password for %s: %s  (they must change it at next sign in)" % (u["username"], temp), "ok")
-    return redirect(url_for("dashboard", tab="users"))
 
 # ------------------------------------------------------------------ PDF
 def make_pdf(r):
@@ -642,12 +778,12 @@ button.s,.btn.s{background:transparent;color:var(--pr);border:1px solid var(--pr
 a{color:var(--pr)}.ck label{display:inline-flex;align-items:center;margin:4px 16px 4px 0;color:var(--tx)}
 .msg{padding:10px 14px;border-radius:6px;margin-bottom:14px}.msg.err{background:#f8d7d7;color:#8e2323}.msg.ok{background:#d5f0de;color:#1e6b3a}
 .fe{color:#c0392b;font-size:12.5px;margin-top:3px}
-.pw{position:relative}.pw input{padding-right:66px}button.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);margin:0;padding:3px 9px;font-size:12px;background:var(--card);color:var(--pr);border:1px solid var(--bd)}
+.pw{position:relative}.pw input{padding-right:48px}button.eye{position:absolute;right:5px;top:50%;transform:translateY(-50%);margin:0;padding:0;width:34px;height:30px;display:grid;place-items:center;background:transparent;color:var(--pr);border:0;border-radius:8px}button.eye svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}button.eye:hover{background:rgba(20,65,123,.1)}
 table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--bd);vertical-align:top}th{color:var(--mu);font-weight:600}.tb{overflow-x:auto}
 .b{padding:2px 9px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap}.Pending{background:#fff1c9;color:#7a5a00}.Approved{background:#d5f0de;color:#1e6b3a}.Disapproved{background:#f8d7d7;color:#8e2323}.Returned{background:#dbe7fb;color:#14417b}
 .tabs{display:flex;flex-wrap:wrap;margin-bottom:14px}.tabs a{margin:0 6px 6px 0;padding:8px 14px;border:1px solid var(--pr);border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;color:var(--pr)}.tabs a.on{background:var(--pr);color:#fff}
 .auth{max-width:540px;width:100%;margin:clamp(20px,6vh,56px) auto;padding:clamp(22px,4vw,38px)}
-.auth h2{font-size:26px;margin-bottom:18px}.auth label{font-size:14px;margin:14px 0 5px}.auth input{padding:12px 13px;font-size:16px}.auth .pw input{padding-right:78px}
+.auth h2{font-size:26px;margin-bottom:18px}.auth label{font-size:14px;margin:14px 0 5px}.auth input{padding:12px 13px;font-size:16px}.auth .pw input{padding-right:54px}
 .auth button:not(.eye),.auth .btn{padding:12px 24px;font-size:15px;margin-top:18px}.erow{display:flex;gap:8px;margin-bottom:6px}.erow select{flex:2}.erow input{flex:1}
 .cal{width:100%;table-layout:fixed}.cal td,.cal th{border:1px solid var(--bd);height:74px;padding:3px;font-size:11px;overflow:hidden}.cal th{height:auto;text-align:center}
 .cal i{display:block;font-style:normal;color:#fff;border-radius:3px;padding:0 4px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cal i.Approved{background:var(--pr)}.cal i.Pending{background:#c9a227}
@@ -655,16 +791,71 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;p
 .who{margin-left:auto;font-size:13px;padding:8px 2px;color:var(--tx)}.who button.lk{color:var(--pr);background:none;border:0;padding:0;margin:0;font:inherit;text-decoration:underline;cursor:pointer;display:inline}
 .dash .who{background:rgba(255,255,255,.92);border-radius:6px;padding:8px 12px;margin-bottom:6px}
 form.in{display:inline}.mu{color:var(--mu);font-size:12px}
+/* ---------- animations: hover, click and page transitions ---------- */
+button,.btn,a.nav{transition:transform .16s ease,box-shadow .16s ease,background-color .16s ease,color .16s ease,border-color .16s ease,filter .16s ease}
+button:not(.eye):not(.menubtn):not(.bell):not(.x):not(.x2):hover:not(:disabled),.btn:hover{transform:translateY(-2px);box-shadow:0 7px 16px rgba(20,65,123,.3);filter:brightness(1.08)}
+button.s:hover:not(:disabled),.btn.s:hover{background:rgba(20,65,123,.09);box-shadow:0 5px 12px rgba(20,65,123,.18)}
+button:not(.eye):not(.menubtn):not(.bell):not(.x):not(.x2):active:not(:disabled),.btn:active{transform:translateY(0) scale(.95);box-shadow:none;filter:brightness(.94)}
+.rip{position:absolute;border-radius:50%;background:rgba(255,255,255,.55);transform:scale(0);animation:rip .6s ease-out;pointer-events:none}button.s .rip,.btn.s .rip,.side .rip{background:rgba(20,65,123,.25)}.side a.nav .rip{background:rgba(255,255,255,.35)}
+@keyframes rip{to{transform:scale(2.8);opacity:0}}
+input,select{transition:border-color .16s ease,box-shadow .16s ease,transform .16s ease,background-color .16s ease}
+input:hover:not(:disabled),select:hover:not(:disabled){border-color:#7fa6d6;box-shadow:0 2px 9px rgba(20,65,123,.15)}
+input:focus,select:focus{outline:none;border-color:var(--pr);box-shadow:0 0 0 3px rgba(20,65,123,.22);transform:translateY(-1px)}
+input[type=checkbox]{transition:transform .15s ease}input[type=checkbox]:hover{transform:scale(1.2)}
+.ck label{transition:transform .15s ease}.ck label:hover{transform:translateX(3px)}
+a{transition:opacity .15s ease,color .15s ease,background-color .15s ease}a:hover{opacity:.8}
+.tb tr{transition:background-color .15s ease}.tb tr:hover td{background:rgba(20,65,123,.06)}
+.wrap>.card,.wrap>.msg,.wrap>p,.wrap>form{animation:pageIn .42s cubic-bezier(.22,.8,.3,1) both}.wrap>.card:nth-of-type(2){animation-delay:.06s}.wrap>.card:nth-of-type(3){animation-delay:.12s}
+@keyframes pageIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+body.leaving .wrap>.card,body.leaving .wrap>.msg,body.leaving .wrap>p,body.leaving .wrap>form{opacity:0;transform:translateY(-10px);animation:none;transition:opacity .18s ease,transform .18s ease}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 .tp{display:flex;gap:6px}.tp select{flex:1;min-width:0;padding:9px 6px}
-.sidehandle{position:fixed;left:0;top:120px;z-index:40;writing-mode:vertical-rl;margin:0;padding:16px 9px;border-radius:0 10px 10px 0;font-size:13px;letter-spacing:1.5px;box-shadow:2px 2px 8px rgba(0,0,0,.25)}
-.sideBg{position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:50;display:none}.sideBg.open{display:block}
-.side{position:fixed;top:0;left:0;bottom:0;width:min(290px,84vw);background:#fff;z-index:60;transform:translateX(-105%);transition:transform .22s ease;display:flex;flex-direction:column;box-shadow:3px 0 16px rgba(0,0,0,.3);overflow-y:auto}
-.side.open{transform:none}.sidehead{background:#b7e4c7;color:#1b4332;padding:14px 18px;display:flex;justify-content:space-between;align-items:center;font-size:17px;border-bottom:4px solid #74c69d}
-.sidehead .x{background:none;color:#1b4332;font-size:26px;line-height:1;padding:0 4px;margin:0}
-.side a.nav{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;text-decoration:none;color:var(--tx);font-weight:600;border-left:5px solid transparent;border-bottom:1px solid #eef1f5}
-.side a.nav.on{background:#e8f5ec;border-left-color:#2b7a47;color:#14532d}.side .cnt{background:#e3e8ef;border-radius:10px;padding:0 9px;font-size:12px;font-weight:600}
-.side .foot{margin-top:auto;border-top:1px solid var(--bd);padding:16px 18px;font-size:13px;display:flex;flex-direction:column;gap:6px;align-items:flex-start}
-@media(max-width:700px){.dash .wrap{padding-left:44px;padding-right:12px}}
+/* ---------- side menu (new style): dark-green drawer, icons, gold active pill ---------- */
+.menubtn{position:fixed;left:0;top:112px;z-index:40;width:40px;height:58px;margin:0;padding:0;border:0;border-radius:0 18px 18px 0;background:linear-gradient(135deg,#2d6a4f,#14532d);color:#fff;display:grid;place-items:center;box-shadow:3px 4px 12px rgba(20,83,45,.45);transition:width .2s ease,box-shadow .2s ease}
+.menubtn:hover{width:50px;box-shadow:4px 6px 16px rgba(20,83,45,.6)}.menubtn svg,.side svg,.bell svg,.toast svg,.ni svg,.sideuser .x svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.sideBg{position:fixed;inset:0;background:rgba(6,30,18,.5);backdrop-filter:blur(2px);z-index:50;opacity:0;pointer-events:none;transition:opacity .25s ease}.sideBg.open{opacity:1;pointer-events:auto}
+.side{position:fixed;top:0;left:0;bottom:0;width:min(300px,86vw);background:linear-gradient(185deg,#14532d 0%,#1b4332 55%,#0f3d2a 100%);color:#e8f5ec;z-index:60;transform:translateX(-106%);transition:transform .3s cubic-bezier(.22,.8,.3,1);display:flex;flex-direction:column;box-shadow:6px 0 28px rgba(0,0,0,.4);overflow-y:auto;border-radius:0 24px 24px 0}
+.side.open{transform:none}.sideuser{display:flex;align-items:center;gap:12px;padding:22px 18px 16px;border-bottom:1px solid rgba(255,255,255,.14)}
+.av{width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#e0bb4a,#c9a227);color:#1b3a1b;display:grid;place-items:center;font:700 20px Georgia,serif;flex:none}
+.who2{display:flex;flex-direction:column;min-width:0;flex:1}.who2 b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:15px}.who2 span{font-size:12px;color:#95d5b2;text-transform:uppercase;letter-spacing:1px}
+.side .x{background:rgba(255,255,255,.1);color:#fff;border:0;border-radius:50%;width:32px;height:32px;padding:0;margin:0;display:grid;place-items:center}.side .x:hover{background:rgba(255,255,255,.22);transform:rotate(90deg)}
+.navlabel{padding:16px 22px 6px;font-size:11px;letter-spacing:1.6px;text-transform:uppercase;color:#95d5b2}
+.side a.nav{position:relative;overflow:hidden;display:flex;align-items:center;gap:12px;margin:3px 12px;padding:11px 14px;border-radius:14px;color:#d8f3dc;font-weight:600;text-decoration:none}
+.side a.nav:hover{background:rgba(255,255,255,.12);transform:translateX(5px);opacity:1}.side a.nav.on{background:linear-gradient(90deg,#c9a227,#e6c453);color:#173a1f;box-shadow:0 4px 12px rgba(0,0,0,.25)}
+.side .cnt{margin-left:auto;background:rgba(255,255,255,.2);border-radius:20px;padding:0 9px;font-size:12px;font-weight:700}.side a.nav.on .cnt{background:rgba(0,0,0,.14)}
+.side.open a.nav,.side.open .navlabel{animation:slideIn .38s ease both;animation-delay:calc(var(--i,1)*35ms)}
+@keyframes slideIn{from{opacity:0;transform:translateX(-18px)}to{opacity:1;transform:none}}
+.side .foot{margin-top:auto;padding:14px 12px 20px;border-top:1px solid rgba(255,255,255,.14)}
+.side .signout{display:flex;align-items:center;justify-content:center;gap:10px;width:calc(100% - 0px);margin:8px 0 0;padding:11px;background:rgba(255,255,255,.1);color:#fff;border:1px solid rgba(255,255,255,.25);border-radius:14px}.side .signout:hover{background:#a63232;border-color:#a63232}
+@media(max-width:700px){.dash .wrap{padding-left:46px;padding-right:12px}}
+/* ---------- notification bell + panel + toast (students) ---------- */
+.bell{position:fixed;right:14px;top:100px;z-index:40;width:46px;height:46px;margin:0;padding:0;border-radius:50%;border:0;background:#fff;color:#14532d;display:grid;place-items:center;box-shadow:0 4px 14px rgba(0,0,0,.25);transition:transform .18s ease,box-shadow .18s ease}
+.bell:hover{transform:scale(1.1);box-shadow:0 8px 20px rgba(0,0,0,.3)}.bell:active{transform:scale(.94)}.bell.ring svg{animation:ring 1.4s ease infinite;transform-origin:50% 0}
+@keyframes ring{0%,60%,100%{transform:rotate(0)}10%{transform:rotate(16deg)}20%{transform:rotate(-14deg)}30%{transform:rotate(10deg)}40%{transform:rotate(-8deg)}50%{transform:rotate(4deg)}}
+.badge{position:absolute;top:1px;right:1px;min-width:19px;height:19px;border-radius:10px;background:#d62828;color:#fff;font:700 11px/19px system-ui;text-align:center;padding:0 5px;box-shadow:0 0 0 2px #fff}
+.npanel{position:fixed;right:14px;top:154px;z-index:45;width:min(380px,calc(100vw - 28px));max-height:62vh;overflow:auto;background:#fff;border-radius:16px;box-shadow:0 14px 40px rgba(0,0,0,.35);opacity:0;transform:translateY(-10px) scale(.97);pointer-events:none;transition:opacity .2s ease,transform .2s ease}
+.npanel.open{opacity:1;transform:none;pointer-events:auto}.nh{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;background:linear-gradient(135deg,#14532d,#2d6a4f);color:#fff;border-radius:16px 16px 0 0;position:sticky;top:0}
+.nh .x2{background:none;border:0;color:#fff;font-size:24px;line-height:1;padding:0 4px;margin:0}
+.ni{display:flex;gap:12px;padding:13px 18px;border-bottom:1px solid #edf1ee;text-decoration:none;color:var(--tx);font-size:14px;transition:background-color .15s ease,transform .15s ease}.ni:hover{background:#f1f8f3;transform:translateX(3px);opacity:1}
+.ni.new{background:#f4fbf6;border-left:4px solid #2b7a47}.ni .dot{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;flex:none;color:#fff}.ni.approved .dot{background:#2b7a47}.ni.disapproved .dot{background:#b3261e}
+.ni small{display:block;color:var(--mu);font-size:11.5px;margin-top:3px}.npanel .empty{padding:26px 18px;color:var(--mu);font-size:13.5px;text-align:center}
+.toast{position:fixed;right:14px;bottom:18px;z-index:70;display:flex;align-items:center;gap:10px;background:#14532d;color:#fff;padding:12px 18px;border-radius:14px;box-shadow:0 10px 28px rgba(0,0,0,.35);cursor:pointer;animation:toastIn .45s cubic-bezier(.2,.9,.3,1.2) both;transition:opacity .4s ease,transform .4s ease}
+.toast.hide{opacity:0;transform:translateY(20px);pointer-events:none}@keyframes toastIn{from{opacity:0;transform:translateY(30px) scale(.9)}to{opacity:1;transform:none}}
+/* ---------- calendar event details (admin) ---------- */
+.cal i.clk{cursor:pointer}.cal i.clk:hover{transform:scale(1.05);filter:brightness(1.15);box-shadow:0 3px 8px rgba(0,0,0,.3)}
+.modalbg{position:fixed;inset:0;background:rgba(6,30,18,.55);backdrop-filter:blur(3px);z-index:80;display:none;align-items:center;justify-content:center;padding:14px}.modalbg.open{display:flex;animation:fade .2s ease}
+@keyframes fade{from{opacity:0}to{opacity:1}}@keyframes pop{from{opacity:0;transform:scale(.92) translateY(10px)}to{opacity:1;transform:none}}
+.modal{background:#fff;border-radius:18px;max-width:580px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.4);animation:pop .28s cubic-bezier(.2,.9,.3,1.1)}
+.mh{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:18px 22px;background:linear-gradient(135deg,#14532d,#2d6a4f);color:#fff;border-radius:18px 18px 0 0}.mh h3{margin:2px 0 0;font:600 20px Georgia,serif}.mh .mu2{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:#b7e4c7}
+.mh .x{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:50%;width:34px;height:34px;padding:0;margin:0;display:grid;place-items:center;flex:none}.mh .x svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2.4;stroke-linecap:round}.mh .x:hover{background:rgba(255,255,255,.3);transform:rotate(90deg)}
+.mb{padding:18px 22px 22px}.mb dl{display:grid;grid-template-columns:150px 1fr;gap:9px 14px;margin:0 0 14px}.mb dt{color:var(--mu);font-size:13px}.mb dd{margin:0;font-weight:500;word-break:break-word}
+@media(max-width:480px){.mb dl{grid-template-columns:1fr;gap:2px}.mb dt{margin-top:8px}}
+/* ---------- monthly report ---------- */
+.rbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px}.rf{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:1;min-width:220px}.rf input,.rf select{width:auto;flex:1;min-width:130px}.rf button,.rbar .btn{margin:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 12px}.chips a{padding:4px 12px;border-radius:20px;border:1px solid #b7d7c4;background:#f2f8f4;color:#14532d;text-decoration:none;font-size:12.5px;font-weight:600}.chips a.on,.chips a:hover{background:#14532d;color:#fff;opacity:1}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin:14px 0}.stat{background:#f2f8f4;border:1px solid #cfe6d8;border-radius:14px;padding:12px 14px;transition:transform .18s ease,box-shadow .18s ease}
+.stat:hover{transform:translateY(-4px);box-shadow:0 10px 20px rgba(20,83,45,.18)}.stat b{display:block;font:700 28px Georgia,serif;color:#14532d}.stat span{font-size:12px;color:var(--mu)}
+.g3{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-bottom:12px}.g3 h4{margin:0 0 6px;font-size:13px;color:#14532d}
 """
 T = {}
 T["base.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -673,17 +864,37 @@ T["base.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <div class="ht"><h1>Southern Luzon State University - Judge Guillermo Eleazar</h1><small>General Services Office - Facility &amp; Equipment Request</small></div>
 <img src="{{ url_for('logo', n='2') }}" alt="SLSU-JGE"></header>
 <div class="wrap">{% for c, m in get_flashed_messages(with_categories=true) %}<div class="msg {{ c }}">{{ m }}</div>{% endfor %}{% block body %}{% endblock %}</div>
-<script>document.querySelectorAll('input[type=password]').forEach(function(i){var w=document.createElement('div');w.className='pw';i.parentNode.insertBefore(w,i);w.appendChild(i);
-var b=document.createElement('button');b.type='button';b.className='eye';b.textContent='Show';b.onclick=function(){var h=i.type==='password';i.type=h?'text':'password';b.textContent=h?'Hide':'Show'};w.appendChild(b)});
+<script>var EYE={{ ('<svg viewBox="0 0 24 24">' ~ ICONS['eye'] ~ '</svg>')|tojson }},EYEOFF={{ ('<svg viewBox="0 0 24 24">' ~ ICONS['eyeoff'] ~ '</svg>')|tojson }};
+document.querySelectorAll('input[type=password]').forEach(function(i){var w=document.createElement('div');w.className='pw';i.parentNode.insertBefore(w,i);w.appendChild(i);
+var b=document.createElement('button');b.type='button';b.className='eye';b.innerHTML=EYE;b.setAttribute('aria-label','Show password');b.onclick=function(){var h=i.type==='password';i.type=h?'text':'password';b.innerHTML=h?EYEOFF:EYE;b.setAttribute('aria-label',h?'Hide password':'Show password')};w.appendChild(b)});
 function menu(o){var s=document.getElementById('side'),b=document.getElementById('sideBg');if(!s)return;if(o===undefined)o=!s.classList.contains('open');s.classList.toggle('open',o);b.classList.toggle('open',o)}
-document.addEventListener('keydown',function(e){if(e.key==='Escape')menu(false)})</script>
+document.addEventListener('keydown',function(e){if(e.key==='Escape')menu(false)});
+document.addEventListener('click',function(e){var b=e.target.closest('button:not(.bell):not(.x):not(.x2):not(.menubtn),.btn,a.nav');if(!b||b.disabled)return;
+ var cs=getComputedStyle(b);if(cs.position==='static')b.style.position='relative';b.style.overflow='hidden';
+ var r=b.getBoundingClientRect(),z=Math.max(r.width,r.height),p=document.createElement('span');p.className='rip';
+ p.style.cssText='width:'+z+'px;height:'+z+'px;left:'+(e.clientX-r.left-z/2)+'px;top:'+(e.clientY-r.top-z/2)+'px';b.appendChild(p);setTimeout(function(){p.remove()},650)});
+document.addEventListener('click',function(e){var a=e.target.closest('a[href]');if(!a||a.target||a.hasAttribute('download')||e.defaultPrevented||e.button||e.ctrlKey||e.metaKey||e.shiftKey||e.altKey)return;
+ var u=new URL(a.href,location.href);if(u.origin!==location.origin||/(pdf|csv)$/.test(u.pathname)||u.href===location.href||u.hash&&u.pathname===location.pathname&&u.search===location.search)return;
+ e.preventDefault();document.body.classList.add('leaving');setTimeout(function(){location.href=a.href},200)});
+document.addEventListener('submit',function(e){if(!e.defaultPrevented)document.body.classList.add('leaving')});
+window.addEventListener('pageshow',function(){document.body.classList.remove('leaving')})</script>
 </body></html>"""
 T["macros.html"] = """
 {% macro fe(e, k) %}{% for x in e.get(k, []) %}<div class="fe">{{ x }}</div>{% endfor %}{% endmacro %}
-{% macro side(items, tab) %}<button type="button" class="sidehandle" onclick="menu(true)" aria-label="Open menu">&#9776; MENU</button><div id="sideBg" class="sideBg" onclick="menu(false)"></div>
-<nav id="side" class="side"><div class="sidehead"><b>Menu</b><button type="button" class="x" onclick="menu(false)" aria-label="Close menu">&times;</button></div>
-{% for k, label, n in items %}<a class="nav {{ 'on' if tab == k }}" href="{{ url_for('dashboard', tab=k) }}">{{ label }}{% if n is not none %}<span class="cnt">{{ n }}</span>{% endif %}</a>{% endfor %}
-<div class="foot"><div><b>{{ g.user.fullname }}</b> ({{ g.user.role }})</div><a href="{{ url_for('account') }}">Change password</a><form class="in" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="s sm">Sign out</button></form></div></nav>{% endmacro %}
+{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{{ ICONS[n]|safe }}</svg>{% endmacro %}
+{% macro side(items, tab) %}<button type="button" class="menubtn" onclick="menu(true)" aria-label="Open menu">{{ ico('menu') }}</button><div id="sideBg" class="sideBg" onclick="menu(false)"></div>
+<nav id="side" class="side"><div class="sideuser"><div class="av">{{ (g.user.fullname or '?')[:1]|upper }}</div><div class="who2"><b>{{ g.user.fullname }}</b><span>{{ g.user.role }}</span></div><button type="button" class="x" onclick="menu(false)" aria-label="Close menu">{{ ico('x') }}</button></div>
+{% for k, label, n, ic in items %}{% if k == '__label' %}<div class="navlabel" style="--i:{{ loop.index }}">{{ label }}</div>{% else %}<a class="nav {{ 'on' if tab == k }}" style="--i:{{ loop.index }}" href="{{ url_for('dashboard', tab=k) }}">{{ ico(ic) }}<span>{{ label }}</span>{% if n is not none %}<span class="cnt">{{ n }}</span>{% endif %}</a>{% endif %}{% endfor %}
+<div class="foot"><a class="nav" href="{{ url_for('account') }}">{{ ico('lock') }}<span>Change password</span></a><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="signout">{{ ico('out') }}<span>Sign out</span></button></form></div></nav>{% endmacro %}
+{% macro bell(notifs, unread) %}<button type="button" class="bell {{ 'ring' if unread }}" onclick="toggleN()" aria-label="Notifications">{{ ico('bell') }}{% if unread %}<span class="badge" id="nBadge">{{ unread }}</span>{% endif %}</button>
+<div id="npanel" class="npanel"><div class="nh"><b>Notifications</b><button type="button" class="x2" onclick="toggleN(false)" aria-label="Close">&times;</button></div>
+{% for n in notifs %}<a class="ni {{ 'new' if not n.read_at }} {{ n.kind }}" href="{{ url_for('dashboard', tab='mine') }}"><span class="dot">{{ ico('check' if n.kind == 'approved' else 'x') }}</span><span class="nt">{{ n.message }}<small>{{ n.created_at|dt12 }}</small></span></a>{% else %}<div class="empty">No notifications yet. You will be notified here when your request is approved or disapproved.</div>{% endfor %}</div>
+{% if unread %}<div id="toast" class="toast" onclick="toggleN(true)">{{ ico('bell') }}<span>You have {{ unread }} new notification{{ 's' if unread != 1 }}</span></div>{% endif %}
+<script>var NTOK={{ csrf()|tojson }};
+function toggleN(o){var p=document.getElementById('npanel');if(o===undefined)o=!p.classList.contains('open');p.classList.toggle('open',o);var t=document.getElementById('toast');if(t)t.remove();
+ var b=document.getElementById('nBadge');if(o&&b){b.remove();document.querySelector('.bell').classList.remove('ring');fetch('/notifications/read',{method:'POST',body:new URLSearchParams({_csrf:NTOK}),credentials:'same-origin'})}}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')toggleN(false)});
+setTimeout(function(){var t=document.getElementById('toast');if(t)t.classList.add('hide')},6500)</script>{% endmacro %}
 {% macro when(r) %}{% set rd = r.return_date or r.event_date %}{% if rd == r.event_date %}{{ r.event_date|dfmt }}<br><span class="mu">{{ r.t1|t12 }} - {{ r.t2|t12 }}</span>{% else %}<b>From:</b> {{ r.event_date|dfmt }} <span class="mu">{{ r.t1|t12 }}</span><br><b>Return:</b> {{ rd|dfmt }} <span class="mu">{{ r.t2|t12 }}</span>{% endif %}{% endmacro %}
 {% macro token() %}<input type="hidden" name="_csrf" value="{{ csrf() }}">{% endmacro %}
 {% macro table(rows, admin=False, tab='', title='') %}<div class="card">{% if title %}<h2>{{ title }}</h2>{% endif %}<div class="tb"><table><tr><th>RFU No.</th>{% if admin %}<th>Requester</th>{% endif %}<th>Event</th><th>Date &amp; time</th><th>Resources</th><th>Status</th><th>Actions</th></tr>
@@ -696,11 +907,22 @@ T["macros.html"] = """
 {% if r.status == 'Approved' and not r.returned_at %}<form class="in" method="post" action="{{ url_for('admin_action', rid=r.id, action='returned') }}">{{ token() }}<input type="hidden" name="back" value="{{ tab }}"><button class="sm">{{ 'Mark Returned' if r.its else 'Mark Completed' }}</button></form>{% endif %}
 {% if r.status != 'Disapproved' and not r.returned_at %}<form method="post" action="{{ url_for('admin_action', rid=r.id, action='disapprove') }}">{{ token() }}<input type="hidden" name="back" value="{{ tab }}"><input name="remarks" placeholder="Reason (required)" required style="padding:4px;font-size:12px;margin-top:4px"><button class="sm r">Disapprove</button></form>{% endif %}{% endif %}</td></tr>
 {% else %}<tr><td colspan="7">No requests.</td></tr>{% endfor %}</table></div></div>{% endmacro %}
-{% macro calendar(weeks, days, title, prev, next, tab) %}<div class="card"><h2>Booking Calendar</h2>
+{% macro calendar(weeks, days, title, prev, next, tab, detail=False, evdata=none) %}<div class="card"><h2>Booking Calendar</h2>
 <div style="display:flex;justify-content:space-between;align-items:center"><a class="btn s" href="{{ url_for('dashboard', tab=tab, m=prev) }}">&lsaquo;</a><b>{{ title }}</b><a class="btn s" href="{{ url_for('dashboard', tab=tab, m=next) }}">&rsaquo;</a></div>
 <table class="cal" style="margin-top:8px"><tr>{% for d in ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] %}<th>{{ d }}</th>{% endfor %}</tr>
-{% for w in weeks %}<tr>{% for d in w %}<td>{% if d %}{{ d }}{% for r in days.get(d, []) %}<i class="{{ r.status }}" title="{{ r.event }}: {{ r.event_date|dfmt }} {{ r.t1|t12 }} to {{ r.rd|dfmt }} {{ r.t2|t12 }} - {{ r.res }}">{{ r.lbl }}</i>{% endfor %}{% endif %}</td>{% endfor %}</tr>{% endfor %}</table>
-<p class="mu">Navy = Approved &middot; Gold = Pending. Hover an entry for details.</p></div>{% endmacro %}"""
+{% for w in weeks %}<tr>{% for d in w %}<td>{% if d %}{{ d }}{% for r in days.get(d, []) %}<i class="{{ r.status }}{{ ' clk' if detail }}" {% if detail %}onclick="showEv({{ r.id }})" onkeydown="if(event.key==='Enter')showEv({{ r.id }})" tabindex="0" role="button"{% endif %} title="{{ r.event }}: {{ r.event_date|dfmt }} {{ r.t1|t12 }} to {{ r.rd|dfmt }} {{ r.t2|t12 }} - {{ r.res }}">{{ r.lbl }}</i>{% endfor %}{% endif %}</td>{% endfor %}</tr>{% endfor %}</table>
+<p class="mu">Navy = Approved &middot; Gold = Pending. {{ 'Click an event to see its full details.' if detail else 'Hover an entry for details.' }}</p></div>
+{% if detail %}<div id="evBg" class="modalbg" onclick="if(event.target===this)hideEv()"><div class="modal" role="dialog" aria-modal="true"><div class="mh"><div><div class="mu2" id="evNo"></div><h3 id="evTitle"></h3></div><button type="button" class="x" onclick="hideEv()" aria-label="Close"><svg viewBox="0 0 24 24">{{ ICONS['x']|safe }}</svg></button></div><div class="mb"><dl id="evBody"></dl><div id="evAct"></div></div></div></div>
+<script id="evdata" type="application/json">{{ evdata|tojson }}</script>
+<script>(function(){var D=JSON.parse(document.getElementById('evdata').textContent),bg=document.getElementById('evBg');
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+window.showEv=function(id){var d=D[id];if(!d)return;document.getElementById('evNo').textContent='RFU No. '+d.no;document.getElementById('evTitle').textContent=d.event;
+ var rows=[['Status',d.status],['Requester',d.requester],['College/Department',d.dept],['Student no.',d.student],['Username',d.user],['Start',d.start],['Return',d.end],['Est. attendees',d.attendees],['Facility',d.fac],['Equipment',d.items],['Requested by (head)',d.head],['Date filed',d.filed],['Remarks',d.remarks],['Returned on',d.returned]],h='';
+ rows.forEach(function(r){if(r[1]===''||r[1]==null)return;h+='<dt>'+esc(r[0])+'</dt><dd>'+(r[0]==='Status'?'<span class="b '+esc(d.status)+'">'+esc(d.status)+'</span>':esc(r[1]))+'</dd>'});
+ document.getElementById('evBody').innerHTML=h;
+ document.getElementById('evAct').innerHTML='<a class="btn" href="'+esc(d.pdf)+'">Open PDF form</a><a class="btn s" href="/dashboard?tab='+esc(d.tab)+'">View in list</a>';
+ bg.classList.add('open')};
+window.hideEv=function(){bg.classList.remove('open')};document.addEventListener('keydown',function(e){if(e.key==='Escape')hideEv()})})()</script>{% endif %}{% endmacro %}"""
 T["login.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.html' as m %}<form class="card auth" method="post"><h2>Sign In</h2>{{ m.token() }}
 <label>Username</label><input name="username" value="{{ v.get('username', '') }}" autofocus>{{ m.fe(e, 'username') }}
 <label>Password</label><input name="password" type="password" value="{{ v.get('password', '') }}">{{ m.fe(e, 'password') }}
@@ -728,7 +950,8 @@ T["account.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macro
 <button>Update Password</button>{% if not g.user.must_change %}<a class="btn s" href="{{ url_for('dashboard') }}">Cancel</a>{% endif %}</form>
 {% if g.user.must_change %}<form class="in" method="post" action="{{ url_for('logout') }}" style="display:block;text-align:center"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="s">Sign out</button></form>{% endif %}{% endblock %}"""
 T["student.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.html' as m %}
-{{ m.side([('new','New Request',none),('mine','My Requests',mine|length),('cal','Calendar',none)], tab) }}
+{{ m.side([('new','New Request',none,'new'),('mine','My Requests',mine|length,'list'),('cal','Calendar',none,'cal')], tab) }}
+{{ m.bell(notifs, unread) }}
 {% if tab == 'new' %}{% if summary %}<div class="msg err">{{ summary }}</div>{% endif %}
 <form class="card" method="post" action="{{ url_for('new_request') }}"><h2>Request for Facility/Equipment Use</h2>{{ m.token() }}<div class="g">
 <div><label>Requester's name *</label><input name="requester" value="{{ v.requester if 'requester' in v else g.user.fullname }}">{{ m.fe(e, 'requester') }}</div><div><label>Date</label><input value="{{ today }}" disabled></div>
@@ -777,19 +1000,34 @@ $('#ed').addEventListener('change',()=>{const r=$('#rd');r.min=$('#ed').value;if
 {% elif tab == 'mine' %}{{ m.table(mine, False, '', 'My Requests') }}
 {% else %}{{ m.calendar(weeks, days, title, prev, next, 'cal') }}{% endif %}{% endblock %}"""
 T["admin.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.html' as m %}
-{{ m.side([('pending','Pending',cnt.pending),('approved','Approved',cnt.approved),('returned','Returned',cnt.returned),('disapproved','Disapproved',cnt.disapproved),('cal','Calendar',none),('stock','Equipment Stock',none),('users','Users',none)], tab) }}
+{{ m.side([('__label','Requests',none,''),('pending','Pending',cnt.pending,'pending'),('approved','Approved',cnt.approved,'approved'),('returned','Returned',cnt.returned,'returned'),('disapproved','Disapproved',cnt.disapproved,'disapproved'),('__label','Manage',none,''),('cal','Calendar',none,'cal'),('stock','Equipment Stock',none,'stock'),('users','Users',none,'users'),('report','Monthly Report',none,'report')], tab) }}
 {% if tab in ('pending','approved','returned','disapproved') %}{% if tab == 'approved' %}<p class="mu">Approved requests stay here until you click <b>Mark Returned</b>. Unreturned items stay out of stock, even after the event date.</p>{% endif %}{{ m.table(rows, True, tab, {'pending': 'Pending Requests', 'approved': 'Approved - Not Yet Returned', 'returned': 'Returned', 'disapproved': 'Disapproved'}[tab]) }}
-{% elif tab == 'cal' %}{{ m.calendar(weeks, days, title, prev, next, 'cal') }}
+{% elif tab == 'cal' %}{{ m.calendar(weeks, days, title, prev, next, 'cal', true, evdata) }}
 {% elif tab == 'stock' %}<div class="card"><h2>Equipment Stock</h2><p class="mu">You decide which equipment students can borrow and how many you own. Students cannot borrow more than what is left for their chosen date and time. "Out now" = approved and not yet returned.</p>
 {% if inv %}<div class="tb"><table><tr><th>Equipment</th><th>Out now (not returned)</th><th>Available now</th><th>Total stock</th></tr>{% for i in inv %}
 <tr><td>{{ i.name }}</td><td>{{ i.out }}</td><td>{{ [i.stock - i.out, 0]|max }}</td><td style="white-space:nowrap"><form class="in" method="post" action="{{ url_for('admin_stock') }}">{{ m.token() }}<input type="hidden" name="name" value="{{ i.name }}"><input name="stock" type="number" min="0" value="{{ i.stock }}" style="max-width:90px;display:inline-block"><button class="sm">Save</button></form>
 <form class="in" method="post" action="{{ url_for('admin_stock_delete') }}" onsubmit="return confirm('Remove {{ i.name }} from the equipment list?')">{{ m.token() }}<input type="hidden" name="name" value="{{ i.name }}"><button class="sm r">Delete</button></form></td></tr>{% endfor %}</table></div>{% else %}<p>No equipment yet. Add the first one below.</p>{% endif %}
 <form method="post" action="{{ url_for('admin_stock') }}" class="erow" style="margin-top:14px">{{ m.token() }}<input name="name" placeholder="New equipment name" required><input name="stock" type="number" min="0" placeholder="Quantity" required><button style="margin:0">Add</button></form></div>
-{% else %}<div class="card"><h2>Users</h2><div class="tb"><table><tr><th>Name</th><th>Student no.</th><th>Username</th><th>Role</th><th></th></tr>{% for u in users %}
-<tr><td>{{ u.fullname }}</td><td>{{ u.student_no }}</td><td>{{ u.username }}</td><td>{{ u.role }}</td><td>{% if u.id != g.user.id %}<form class="in" method="post" action="{{ url_for('admin_reset_user', uid=u.id) }}" onsubmit="return confirm('Reset password for {{ u.username }}?')">{{ m.token() }}<button class="sm">Reset password</button></form>{% endif %}</td></tr>{% endfor %}</table></div></div>{% endif %}{% endblock %}"""
+{% elif tab == 'report' %}<div class="card"><h2>Monthly Report - {{ rtitle }}</h2>
+<p class="mu" style="margin:-6px 0 12px">Requests / inquiries received by the GSO. Pick a month to review past inquiries, then download the report.</p>
+<div class="rbar"><a class="btn s" href="{{ url_for('dashboard', tab='report', m=rprev, by=by) }}">&lsaquo; Previous</a>
+<form method="get" action="{{ url_for('dashboard') }}" class="rf"><input type="hidden" name="tab" value="report"><input type="month" name="m" value="{{ ym }}"><select name="by"><option value="filed" {{ 'selected' if by == 'filed' }}>By date filed</option><option value="event" {{ 'selected' if by == 'event' }}>By event date</option></select><button>Show</button></form>
+<a class="btn s" href="{{ url_for('dashboard', tab='report', m=rnext, by=by) }}">Next &rsaquo;</a></div>
+{% if months %}<div class="chips"><span class="mu">Past months:</span>{% for mm, label, c in months %}<a class="{{ 'on' if mm == ym }}" href="{{ url_for('dashboard', tab='report', m=mm, by=by) }}">{{ label }} ({{ c }})</a>{% endfor %}</div>{% endif %}
+<div class="stats"><div class="stat"><b>{{ rep.st.total }}</b><span>Total requests</span></div><div class="stat"><b>{{ rep.st.approved }}</b><span>Approved</span></div><div class="stat"><b>{{ rep.st.disapproved }}</b><span>Disapproved</span></div><div class="stat"><b>{{ rep.st.pending }}</b><span>Pending</span></div><div class="stat"><b>{{ rep.st.returned }}</b><span>Returned</span></div><div class="stat"><b>{{ rep.st.not_returned }}</b><span>Approved, not yet returned</span></div></div>
+<div class="g3"><div><h4>College/Department</h4><table>{% for d in rep.depts %}<tr><td>{{ d[0] }}</td><td style="text-align:right">{{ d[1] }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div>
+<div><h4>Facility used</h4><table>{% for f, c in rep.fac %}<tr><td>{{ f }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div>
+<div><h4>Equipment borrowed (qty)</h4><table>{% for f, c in rep.eq %}<tr><td>{{ f }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div></div>
+<div style="margin:6px 0 14px"><a class="btn" href="{{ url_for('report_pdf', m=ym, by=by) }}">Download PDF</a><a class="btn s" href="{{ url_for('report_csv', m=ym, by=by) }}">Download CSV (Excel)</a></div>
+<div class="tb"><table><tr><th>RFU No.</th><th>Date filed</th><th>Requester</th><th>Event</th><th>Schedule</th><th>Resources</th><th>Status</th></tr>
+{% for r in rep.rows %}<tr><td>{{ r.rfu_no }}</td><td>{{ r.created_at|dt12 }}</td><td>{{ r.requester }}<br><span class="mu">{{ r.dept }}</span></td><td>{{ r.event }}</td><td>{{ m.when(r) }}</td><td><span class="mu" style="font-size:13px">{{ r.res }}</span></td><td><span class="b {{ r.badge }}">{{ r.badge }}</span></td></tr>
+{% else %}<tr><td colspan="7">No requests for this period.</td></tr>{% endfor %}</table></div></div>
+{% else %}<div class="card"><h2>Users</h2><div class="tb"><table><tr><th>Name</th><th>Student no.</th><th>Username</th><th>Role</th></tr>{% for u in users %}
+<tr><td>{{ u.fullname }}</td><td>{{ u.student_no }}</td><td>{{ u.username }}</td><td>{{ u.role }}</td></tr>{% endfor %}</table></div></div>{% endif %}{% endblock %}"""
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["csrf"] = csrf
 app.jinja_env.filters.update(t12=t12, dfmt=dfmt, dt12=dt12)
+app.jinja_env.globals["ICONS"] = ICONS
 
 init_db()
 
