@@ -20,7 +20,7 @@ OPTIONAL ENVIRONMENT VARIABLES
 For real deployment use HTTPS and a WSGI server, e.g.:  pip install waitress ; waitress-serve --port=8000 app:app
 """
 import os, io, re, sys, json, time, base64, secrets, sqlite3
-from calendar import Calendar
+from calendar import Calendar, monthrange
 from datetime import datetime, date, timedelta, timezone
 from flask import (Flask, g, request, session, redirect, url_for, render_template,
                    flash, abort, send_file, jsonify, Response)
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NO
 CREATE TABLE IF NOT EXISTS inventory(name TEXT PRIMARY KEY COLLATE NOCASE, stock INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, rfu_no TEXT, user_id INTEGER NOT NULL, requester TEXT, dept TEXT,
   event TEXT, event_date TEXT, t1 TEXT, t2 TEXT, attendees TEXT, facilities TEXT DEFAULT '[]', head TEXT,
-  status TEXT DEFAULT 'Pending', remarks TEXT DEFAULT '', created_at TEXT, returned_at TEXT);
+  status TEXT DEFAULT 'Pending', remarks TEXT DEFAULT '', created_at TEXT, returned_at TEXT, return_date TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
   name TEXT NOT NULL, qty INTEGER NOT NULL);
@@ -132,6 +132,25 @@ def now_dt(): return datetime.now(PH)
 def today_ph(): return now_dt().date()
 def now_s(): return now_dt().strftime("%Y-%m-%d %H:%M")
 
+# ---- 12-hour (AM/PM) display helpers, used by the pages and the PDF
+def t12(t):
+    try: return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
+    except Exception: return t or ""
+def dfmt(d):
+    try: return datetime.strptime((d or "")[:10], "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
+    except Exception: return d or ""
+def dt12(s_):
+    s_ = s_ or ""
+    return (dfmt(s_[:10]) + " " + t12(s_[11:16])).strip()
+
+def _migrate():
+    """Older databases: add the new 'return_date' column (date the facility/equipment will be returned)."""
+    if USE_PG:
+        ex("ALTER TABLE requests ADD COLUMN IF NOT EXISTS return_date TEXT")
+    elif "return_date" not in [c["name"] for c in q("PRAGMA table_info(requests)")]:
+        ex("ALTER TABLE requests ADD COLUMN return_date TEXT")
+    ex("UPDATE requests SET return_date=event_date WHERE return_date IS NULL")
+
 def _remove_old_defaults():
     if not q1("SELECT 1 FROM meta WHERE key='defaults_removed'"):     # equipment is now added by the admin only
         for n, st in OLD_DEFAULTS:
@@ -149,7 +168,7 @@ def init_db():
             cur = db().c.cursor(); cur.execute("SELECT pg_advisory_xact_lock(7242026)"); cur.execute(SCHEMA_PG); db().commit()
         else:
             db().executescript(SCHEMA)
-        for step in (_remove_old_defaults, _ensure_admin):
+        for step in (_migrate, _remove_old_defaults, _ensure_admin):
             try: step()
             except Exception as err: print("init_db note (another worker may have done this already):", err)
 
@@ -197,34 +216,34 @@ def valid_pw(p, p2):
     return None
 
 # ------------------------------------------------------------------ availability logic
-def committed(name, d, t1, t2, exclude=0):
-    """Units of `name` unavailable for the slot: (a) pending/approved requests overlapping the slot,
-    (b) approved requests whose event already ended but were NOT marked Returned yet."""
+def committed(name, st, en, exclude=0):
+    """Units of `name` unavailable between st and en ("YYYY-MM-DD HH:MM"): (a) pending/approved requests that overlap
+    that period, (b) approved requests whose return date/time already passed but were NOT marked Returned yet."""
     r = q1("""SELECT COALESCE(SUM(i.qty),0) s FROM items i JOIN requests r ON r.id=i.request_id
               WHERE i.name=? COLLATE NOCASE AND r.id!=? AND r.returned_at IS NULL AND (
-                (r.status IN ('Pending','Approved') AND r.event_date=? AND r.t1<? AND ?<r.t2)
-                OR (r.status='Approved' AND (r.event_date||' '||r.t2)<=?))""",
-           name, exclude, d, t2, t1, now_s())
+                (r.status IN ('Pending','Approved') AND (r.event_date||' '||r.t1)<? AND ?<(COALESCE(r.return_date,r.event_date)||' '||r.t2))
+                OR (r.status='Approved' AND (COALESCE(r.return_date,r.event_date)||' '||r.t2)<=?))""",
+           name, exclude, en, st, now_s())
     return r["s"]
 
 def stock_of(name):
     r = q1("SELECT name,stock FROM inventory WHERE name=?", name)
     return (r["name"], r["stock"]) if r else (None, None)
 
-def left(name, d, t1, t2, exclude=0):
+def left(name, st, en, exclude=0):
     n, s = stock_of(name)
-    return None if n is None else max(0, s - committed(n, d, t1, t2, exclude))
+    return None if n is None else max(0, s - committed(n, st, en, exclude))
 
-def booked_facilities(d, t1, t2, exclude=0):
+def booked_facilities(st, en, exclude=0):
     s = set()
-    for r in q("SELECT facilities FROM requests WHERE event_date=? AND status IN ('Pending','Approved') AND t1<? AND ?<t2 AND id!=?",
-               d, t2, t1, exclude):
+    for r in q("""SELECT facilities FROM requests WHERE status IN ('Pending','Approved') AND id!=?
+                  AND (event_date||' '||t1)<? AND ?<(COALESCE(return_date,event_date)||' '||t2)""", exclude, en, st):
         s.update(x.lower() for x in json.loads(r["facilities"]))
     return s
 
-def parse_slot(d, t1, t2):
+def parse_slot(d, rd, t1, t2):
     try:
-        datetime.strptime(d, "%Y-%m-%d"); a = datetime.strptime(t1, "%H:%M"); b = datetime.strptime(t2, "%H:%M")
+        a = datetime.strptime(d + " " + t1, "%Y-%m-%d %H:%M"); b = datetime.strptime(rd + " " + t2, "%Y-%m-%d %H:%M")
         return b > a
     except Exception:
         return False
@@ -232,15 +251,14 @@ def parse_slot(d, t1, t2):
 @app.route("/api/availability")
 @login_required
 def api_availability():
-    d, t1, t2 = (request.args.get(k, "") for k in ("d", "t1", "t2"))
-    ok = parse_slot(d, t1, t2)
-    if not ok:      # no slot chosen yet -> show what is booked / out of stock right now
-        n = now_dt(); d, t1, t2 = n.strftime("%Y-%m-%d"), n.strftime("%H:%M"), (n + timedelta(minutes=1)).strftime("%H:%M")
-        if t2 <= t1: t1, t2 = "23:58", "23:59"
-        ok = True
-    out = {"booked": sorted(booked_facilities(d, t1, t2)) if ok else [], "left": {}}
+    d, rd, t1, t2 = (request.args.get(k, "") for k in ("d", "rd", "t1", "t2"))
+    rd = rd or d
+    if parse_slot(d, rd, t1, t2): st, en = d + " " + t1, rd + " " + t2
+    else:      # no valid period chosen yet -> show what is booked / out of stock right now
+        n = now_dt(); st, en = n.strftime("%Y-%m-%d %H:%M"), (n + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+    out = {"booked": sorted(booked_facilities(st, en)), "left": {}}
     for r in q("SELECT name,stock FROM inventory"):
-        out["left"][r["name"]] = left(r["name"], d, t1, t2) if ok else r["stock"]
+        out["left"][r["name"]] = left(r["name"], st, en)
     return jsonify(out)
 
 # ------------------------------------------------------------------ auth routes
@@ -360,9 +378,14 @@ def calendar_ctx():
     try: y, mo = int(m[:4]), int(m[5:7]); date(y, mo, 1)
     except Exception: y, mo = today_ph().year, today_ph().month
     ym = "%04d-%02d" % (y, mo)
+    first, last = ym + "-01", "%s-%02d" % (ym, monthrange(y, mo)[1])
     days = {}
-    for r in enrich(q("SELECT * FROM requests WHERE status IN ('Pending','Approved') AND substr(event_date,1,7)=? ORDER BY t1", ym)):
-        days.setdefault(int(r["event_date"][8:10]), []).append(r)
+    for r in enrich(q("SELECT * FROM requests WHERE status IN ('Pending','Approved') AND event_date<=? AND COALESCE(return_date,event_date)>=? ORDER BY event_date,t1", last, first)):
+        rd = r["return_date"] or r["event_date"]
+        for dd in range(int(max(r["event_date"], first)[8:10]), int(min(rd, last)[8:10]) + 1):
+            key = "%s-%02d" % (ym, dd)
+            lbl = ("%s %s" % (t12(r["t1"]), r["res"])) if key == r["event_date"] else ("Return %s: %s" % (t12(r["t2"]), r["res"])) if key == rd else ("Ongoing: " + r["res"])
+            days.setdefault(dd, []).append(dict(r, lbl=lbl, rd=rd))
     py, pm = (y - 1, 12) if mo == 1 else (y, mo - 1); ny, nm = (y + 1, 1) if mo == 12 else (y, mo + 1)
     return dict(weeks=Calendar(6).monthdayscalendar(y, mo), days=days, title=date(y, mo, 1).strftime("%B %Y"),
                 prev="%04d-%02d" % (py, pm), next="%04d-%02d" % (ny, nm))
@@ -408,28 +431,36 @@ def dashboard():
 @login_required
 def new_request():
     f = request.form; s = lambda k: f.get(k, "").strip()
-    v = {k: s(k) for k in ("requester", "dept", "event", "event_date", "t1", "t2", "attendees", "head", "fac_other")}
+    v = {k: s(k) for k in ("requester", "dept", "event", "event_date", "return_date", "t1", "t2", "attendees", "head", "fac_other")}
     e = {}
     for k, label in (("requester", "Requester's name"), ("dept", "College/Department"), ("event", "Name/Type of event"),
-                     ("event_date", "Date of the event"), ("t1", "Start time"), ("t2", "End time")):
+                     ("event_date", "Date of the event"), ("t1", "Start time"), ("t2", "Return time")):
         if not v[k]: bad(e, k, label + " is required.")
     d, t1, t2 = v["event_date"], v["t1"], v["t2"]
+    rd = v["return_date"] or d
     if d:
         try:
             datetime.strptime(d, "%Y-%m-%d")
             if d < today_ph().isoformat(): bad(e, "event_date", "The event date cannot be in the past. Choose today or a later date.")
         except ValueError: bad(e, "event_date", "Invalid date.")
+    if v["return_date"]:
+        try:
+            datetime.strptime(rd, "%Y-%m-%d")
+            if d and "event_date" not in e and rd < d: bad(e, "return_date", "The return date cannot be earlier than the event date.")
+        except ValueError: bad(e, "return_date", "Invalid date.")
     for k in ("t1", "t2"):
         if v[k]:
             try: datetime.strptime(v[k], "%H:%M")
             except ValueError: bad(e, k, "Invalid time.")
-    if t1 and t2 and "t1" not in e and "t2" not in e and t2 <= t1: bad(e, "t2", "End time must be later than the start time.")
+    if t1 and t2 and "t1" not in e and "t2" not in e and "return_date" not in e and rd == d and t2 <= t1:
+        bad(e, "t2", "Return time must be later than the start time when the return date is the same day.")
     if v["attendees"] and not v["attendees"].isdigit(): bad(e, "attendees", "Attendees must be a whole number.")
-    slot_ok = bool(d and t1 and t2) and not any(k in e for k in ("event_date", "t1", "t2"))
+    slot_ok = bool(d and t1 and t2) and not any(k in e for k in ("event_date", "return_date", "t1", "t2"))
+    st, en = (d + " " + t1, rd + " " + t2) if slot_ok else ("", "")
     fac = [x for x in f.getlist("fac") if x in FACILITIES]
     if v["fac_other"]: fac.append(v["fac_other"][:80])
     if slot_ok:
-        busy = booked_facilities(d, t1, t2); ok_fac = []
+        busy = booked_facilities(st, en); ok_fac = []
         for x in fac:
             if x.lower() in busy:
                 bad(e, "fac", '"%s" is already booked at that time, so it was unchecked. Choose another facility or time.' % x)
@@ -451,9 +482,9 @@ def new_request():
         except ValueError: qy = 0
         if qy <= 0: bad(e, "eq", "%s: enter a quantity of at least 1." % name); rows.append([sel, "", oth]); continue
         if slot_ok and canon:
-            avail = left(canon, d, t1, t2) - valid.get(canon, 0)
+            avail = left(canon, st, en) - valid.get(canon, 0)
             if avail <= 0:
-                bad(e, "eq", "%s is OUT OF STOCK for that date and time (borrowed or reserved and not yet returned), so it was removed." % canon); continue
+                bad(e, "eq", "%s is OUT OF STOCK for those dates and times (borrowed or reserved and not yet returned), so it was removed." % canon); continue
             if qy > avail:
                 bad(e, "eq", "Only %d %s available for that date and time. Please re-enter the quantity." % (avail, canon)); rows.append([sel, "", oth]); continue
         valid[name] = valid.get(name, 0) + qy; rows.append([sel, qy, oth])
@@ -464,9 +495,9 @@ def new_request():
         ctx.update(v=v, e=e, old_items=rows, old_fac=fac,
                    summary="Please fix the highlighted items. Only the incorrect entries were cleared - everything else was kept.")
         return render_template("student.html", **ctx)
-    c = ex("""INSERT INTO requests(user_id,requester,dept,event,event_date,t1,t2,attendees,facilities,head,created_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?)""", g.user["id"], v["requester"][:120], v["dept"][:120], v["event"][:160], d, t1, t2,
-           v["attendees"], json.dumps(fac), v["head"][:120], now_s())
+    c = ex("""INSERT INTO requests(user_id,requester,dept,event,event_date,t1,t2,attendees,facilities,head,created_at,return_date)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", g.user["id"], v["requester"][:120], v["dept"][:120], v["event"][:160], d, t1, t2,
+           v["attendees"], json.dumps(fac), v["head"][:120], now_s(), rd)
     rid = c.lastrowid
     ex("UPDATE requests SET rfu_no=? WHERE id=?", "%d-%04d" % (today_ph().year, rid), rid)
     for n, qy in valid.items(): ex("INSERT INTO items(request_id,name,qty) VALUES(?,?,?)", rid, n, qy)
@@ -481,11 +512,13 @@ def admin_action(rid, action):
     if not r: abort(404)
     if action == "approve":
         for i in q("SELECT name,qty FROM items WHERE request_id=?", rid):
-            l = left(i["name"], r["event_date"], r["t1"], r["t2"], exclude=rid)
+            l = left(i["name"], r["event_date"] + " " + r["t1"], (r["return_date"] or r["event_date"]) + " " + r["t2"], exclude=rid)
             if l is not None and i["qty"] > l:
                 flash("Cannot approve: only %d %s available for that time." % (l, i["name"]), "err")
                 return redirect(url_for("dashboard", tab="pending"))
         ex("UPDATE requests SET status='Approved', remarks='', returned_at=NULL WHERE id=?", rid); flash("Request approved.", "ok")
+    elif action == "disapprove" and r["returned_at"]:
+        flash("This request is already marked as returned, so it can no longer be disapproved.", "err")
     elif action == "disapprove":
         why = request.form.get("remarks", "").strip()
         if not why: flash("Please enter a reason (remarks) for disapproval.", "err"); return redirect(request.referrer or url_for("dashboard"))
@@ -547,12 +580,13 @@ def make_pdf(r):
     R(140, 35, 55, 9); T("R.F.U. No:", 142, 39, 8); T(r["rfu_no"], 150, 42.5, 10, True)
     T("REQUEST FOR FACILITY/EQUIPMENT USE", 105, 52, 12, True, "c")
     y = 62
-    T("Requester's Name:", 15, y); T(r["requester"], 52, y - .5); L(50, y + 1, 120); T("Date:", 130, y); T(r["created_at"][:10], 142, y - .5); L(140, y + 1, 195); y += 8
+    T("Requester's Name:", 15, y); T(r["requester"], 52, y - .5); L(50, y + 1, 120); T("Date:", 130, y); T(dfmt(r["created_at"]), 142, y - .5); L(140, y + 1, 195); y += 8
     T("College/Department:", 15, y); T(r["dept"], 52, y - .5); L(50, y + 1, 120); y += 8
     T("Name/Type of Event:", 15, y); T(r["event"], 52, y - .5); L(50, y + 1, 195); y += 8
-    T("Date of the Event:", 15, y); T(r["event_date"], 50, y - .5); L(48, y + 1, 100)
+    T("Date of the Event:", 15, y); T(dfmt(r["event_date"]), 50, y - .5); L(48, y + 1, 100)
     T("Estimated Attendees:", 110, y); T(r["attendees"], 148, y - .5); L(146, y + 1, 195); y += 8
-    T("Time Reserved:", 15, y); T(r["t1"], 45, y - .5); L(43, y + 1, 70); T("to", 74, y); T(r["t2"], 82, y - .5); L(80, y + 1, 108); y += 9
+    T("Time Reserved:", 15, y); T(t12(r["t1"]), 45, y - .5); L(43, y + 1, 70); T("to", 74, y); T(t12(r["t2"]), 82, y - .5); L(80, y + 1, 108); y += 8
+    T("Date to be Returned:", 15, y); T(dfmt(r["return_date"] or r["event_date"]), 55, y - .5); L(53, y + 1, 105); y += 9
     T("Facility to be used:", 15, y, 10, True); y += 7
     B(25, y, FACILITIES[0] in fac); T(FACILITIES[0], 31, y, 9); B(100, y, FACILITIES[1] in fac); T(FACILITIES[1], 106, y, 9); y += 7
     B(25, y, FACILITIES[2] in fac); T(FACILITIES[2], 31, y, 9); B(100, y, FACILITIES[3] in fac); T(FACILITIES[3], 106, y, 9); y += 7
@@ -569,7 +603,7 @@ def make_pdf(r):
     T("LUALHATI G. AGUILA", 60, y + 14, 9, True, "c"); T("Head, Business Affairs Office", 60, y + 19, 8, False, "c")
     T("RASELIETO B. GARCIA", 150, y + 14, 9, True, "c"); T("Head, General Services Office", 150, y + 19, 8, False, "c"); y += 30
     T("After Facility/Equipment Used:", 15, y, 9, True); y += 7; T("Findings/Observation/Recommendation:", 15, y, 9)
-    note = (r["remarks"] or "") + ("  |  Returned: " + r["returned_at"] if r["returned_at"] else "")
+    note = "  |  ".join(x for x in (r["remarks"] or "", ("Returned: " + dt12(r["returned_at"])) if r["returned_at"] else "") if x)
     for k, ln in enumerate(simpleSplit(note, "Helvetica", 8, 175 * mm)[:2]): T(ln, 17, y + 6.5 + 8 * k, 8)
     L(15, y + 8, 195); L(15, y + 16, 195); y += 30
     T("Checked by:", 20, y); T("Noted:", 120, y); y += 14; L(20, y, 80); L(115, y, 195)
@@ -595,8 +629,8 @@ body.authbg{background:linear-gradient(rgba(255,255,255,.10),rgba(255,255,255,.1
 body.dash{background:linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url('/bg.jpg') center/cover fixed no-repeat}
 .dash .card{background:rgba(255,255,255,.94)}.dash .tabs a{background:rgba(255,255,255,.92)}.dash .tabs a.on{background:var(--pr)}
 .dash .wrap>p.mu{background:rgba(255,255,255,.92);padding:6px 10px;border-radius:6px}
-header{background:#b7e4c7;color:#1b4332;border-bottom:4px solid #74c69d;padding:10px clamp(8px,2vw,22px);display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:clamp(6px,2vw,24px)}
-header img{height:clamp(34px,8vw,62px);width:auto;display:block}.ht{text-align:center;min-width:0}
+header{background:#b7e4c7;color:#1b4332;border-bottom:4px solid #74c69d;padding:10px clamp(8px,2vw,22px);display:flex;flex-wrap:nowrap;justify-content:center;align-items:center;gap:clamp(6px,1.5vw,14px)}
+header img{height:clamp(34px,8vw,62px);width:auto;display:block;flex:none}.ht{text-align:center;min-width:0;flex:0 1 auto}
 header h1{font:600 clamp(11px,2.5vw,19px)/1.25 Georgia,serif;margin:0}header small{opacity:.85;display:block;font-size:clamp(9px,1.8vw,13px);line-height:1.3;margin-top:2px}
 header a,header button.lk{color:#1b4332;background:none;border:0;padding:0;font:inherit;cursor:pointer;text-decoration:underline;margin:0;display:inline}
 .wrap{max-width:980px;margin:22px auto;padding:0 16px}.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:22px;margin-bottom:18px}
@@ -621,6 +655,16 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;p
 .who{margin-left:auto;font-size:13px;padding:8px 2px;color:var(--tx)}.who button.lk{color:var(--pr);background:none;border:0;padding:0;margin:0;font:inherit;text-decoration:underline;cursor:pointer;display:inline}
 .dash .who{background:rgba(255,255,255,.92);border-radius:6px;padding:8px 12px;margin-bottom:6px}
 form.in{display:inline}.mu{color:var(--mu);font-size:12px}
+.tp{display:flex;gap:6px}.tp select{flex:1;min-width:0;padding:9px 6px}
+.sidehandle{position:fixed;left:0;top:120px;z-index:40;writing-mode:vertical-rl;margin:0;padding:16px 9px;border-radius:0 10px 10px 0;font-size:13px;letter-spacing:1.5px;box-shadow:2px 2px 8px rgba(0,0,0,.25)}
+.sideBg{position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:50;display:none}.sideBg.open{display:block}
+.side{position:fixed;top:0;left:0;bottom:0;width:min(290px,84vw);background:#fff;z-index:60;transform:translateX(-105%);transition:transform .22s ease;display:flex;flex-direction:column;box-shadow:3px 0 16px rgba(0,0,0,.3);overflow-y:auto}
+.side.open{transform:none}.sidehead{background:#b7e4c7;color:#1b4332;padding:14px 18px;display:flex;justify-content:space-between;align-items:center;font-size:17px;border-bottom:4px solid #74c69d}
+.sidehead .x{background:none;color:#1b4332;font-size:26px;line-height:1;padding:0 4px;margin:0}
+.side a.nav{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;text-decoration:none;color:var(--tx);font-weight:600;border-left:5px solid transparent;border-bottom:1px solid #eef1f5}
+.side a.nav.on{background:#e8f5ec;border-left-color:#2b7a47;color:#14532d}.side .cnt{background:#e3e8ef;border-radius:10px;padding:0 9px;font-size:12px;font-weight:600}
+.side .foot{margin-top:auto;border-top:1px solid var(--bd);padding:16px 18px;font-size:13px;display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+@media(max-width:700px){.dash .wrap{padding-left:44px;padding-right:12px}}
 """
 T = {}
 T["base.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -630,26 +674,32 @@ T["base.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <img src="{{ url_for('logo', n='2') }}" alt="SLSU-JGE"></header>
 <div class="wrap">{% for c, m in get_flashed_messages(with_categories=true) %}<div class="msg {{ c }}">{{ m }}</div>{% endfor %}{% block body %}{% endblock %}</div>
 <script>document.querySelectorAll('input[type=password]').forEach(function(i){var w=document.createElement('div');w.className='pw';i.parentNode.insertBefore(w,i);w.appendChild(i);
-var b=document.createElement('button');b.type='button';b.className='eye';b.textContent='Show';b.onclick=function(){var h=i.type==='password';i.type=h?'text':'password';b.textContent=h?'Hide':'Show'};w.appendChild(b)})</script>
+var b=document.createElement('button');b.type='button';b.className='eye';b.textContent='Show';b.onclick=function(){var h=i.type==='password';i.type=h?'text':'password';b.textContent=h?'Hide':'Show'};w.appendChild(b)});
+function menu(o){var s=document.getElementById('side'),b=document.getElementById('sideBg');if(!s)return;if(o===undefined)o=!s.classList.contains('open');s.classList.toggle('open',o);b.classList.toggle('open',o)}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')menu(false)})</script>
 </body></html>"""
 T["macros.html"] = """
 {% macro fe(e, k) %}{% for x in e.get(k, []) %}<div class="fe">{{ x }}</div>{% endfor %}{% endmacro %}
-{% macro tabs(items, tab) %}<div class="tabs">{% for k, label in items %}<a class="{{ 'on' if tab == k }}" href="{{ url_for('dashboard', tab=k) }}">{{ label }}</a>{% endfor %}<span class="who">{{ g.user.fullname }} ({{ g.user.role }}) &middot; <a href="{{ url_for('account') }}">Change password</a> &middot; <form class="in" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="lk">Sign out</button></form></span></div>{% endmacro %}
+{% macro side(items, tab) %}<button type="button" class="sidehandle" onclick="menu(true)" aria-label="Open menu">&#9776; MENU</button><div id="sideBg" class="sideBg" onclick="menu(false)"></div>
+<nav id="side" class="side"><div class="sidehead"><b>Menu</b><button type="button" class="x" onclick="menu(false)" aria-label="Close menu">&times;</button></div>
+{% for k, label, n in items %}<a class="nav {{ 'on' if tab == k }}" href="{{ url_for('dashboard', tab=k) }}">{{ label }}{% if n is not none %}<span class="cnt">{{ n }}</span>{% endif %}</a>{% endfor %}
+<div class="foot"><div><b>{{ g.user.fullname }}</b> ({{ g.user.role }})</div><a href="{{ url_for('account') }}">Change password</a><form class="in" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="s sm">Sign out</button></form></div></nav>{% endmacro %}
+{% macro when(r) %}{% set rd = r.return_date or r.event_date %}{% if rd == r.event_date %}{{ r.event_date|dfmt }}<br><span class="mu">{{ r.t1|t12 }} - {{ r.t2|t12 }}</span>{% else %}<b>From:</b> {{ r.event_date|dfmt }} <span class="mu">{{ r.t1|t12 }}</span><br><b>Return:</b> {{ rd|dfmt }} <span class="mu">{{ r.t2|t12 }}</span>{% endif %}{% endmacro %}
 {% macro token() %}<input type="hidden" name="_csrf" value="{{ csrf() }}">{% endmacro %}
-{% macro table(rows, admin=False, tab='') %}<div class="card"><div class="tb"><table><tr><th>RFU No.</th>{% if admin %}<th>Requester</th>{% endif %}<th>Event</th><th>Date &amp; time</th><th>Resources</th><th>Status</th><th>Actions</th></tr>
+{% macro table(rows, admin=False, tab='', title='') %}<div class="card">{% if title %}<h2>{{ title }}</h2>{% endif %}<div class="tb"><table><tr><th>RFU No.</th>{% if admin %}<th>Requester</th>{% endif %}<th>Event</th><th>Date &amp; time</th><th>Resources</th><th>Status</th><th>Actions</th></tr>
 {% for r in rows %}<tr><td>{{ r.rfu_no }}</td>{% if admin %}<td>{{ r.requester }}<br><span class="mu">{{ r.dept }}</span></td>{% endif %}
-<td>{{ r.event }}</td><td>{{ r.event_date }}<br><span class="mu">{{ r.t1 }} - {{ r.t2 }}</span></td><td><span class="mu" style="font-size:13px">{{ r.res }}</span></td>
+<td>{{ r.event }}</td><td>{{ when(r) }}</td><td><span class="mu" style="font-size:13px">{{ r.res }}</span></td>
 <td><span class="b {{ r.badge }}">{{ r.badge }}</span>{% if r.status == 'Approved' and not r.returned_at and r.its %}<br><span class="mu">Not yet returned</span>{% endif %}
-{% if r.returned_at %}<br><span class="mu">{{ r.returned_at }}</span>{% endif %}{% if r.remarks %}<br><span class="mu">Remarks: {{ r.remarks }}</span>{% endif %}</td>
+{% if r.returned_at %}<br><span class="mu">Returned {{ r.returned_at|dt12 }}</span>{% endif %}{% if r.remarks %}<br><span class="mu">Remarks: {{ r.remarks }}</span>{% endif %}</td>
 <td><a href="{{ url_for('request_pdf', rid=r.id) }}">PDF</a>
 {% if admin %}<br>{% if r.status != 'Approved' %}<form class="in" method="post" action="{{ url_for('admin_action', rid=r.id, action='approve') }}">{{ token() }}<input type="hidden" name="back" value="{{ tab }}"><button class="sm gr">Approve</button></form>{% endif %}
 {% if r.status == 'Approved' and not r.returned_at %}<form class="in" method="post" action="{{ url_for('admin_action', rid=r.id, action='returned') }}">{{ token() }}<input type="hidden" name="back" value="{{ tab }}"><button class="sm">{{ 'Mark Returned' if r.its else 'Mark Completed' }}</button></form>{% endif %}
-{% if r.status != 'Disapproved' %}<form method="post" action="{{ url_for('admin_action', rid=r.id, action='disapprove') }}">{{ token() }}<input type="hidden" name="back" value="{{ tab }}"><input name="remarks" placeholder="Reason (required)" required style="padding:4px;font-size:12px;margin-top:4px"><button class="sm r">Disapprove</button></form>{% endif %}{% endif %}</td></tr>
+{% if r.status != 'Disapproved' and not r.returned_at %}<form method="post" action="{{ url_for('admin_action', rid=r.id, action='disapprove') }}">{{ token() }}<input type="hidden" name="back" value="{{ tab }}"><input name="remarks" placeholder="Reason (required)" required style="padding:4px;font-size:12px;margin-top:4px"><button class="sm r">Disapprove</button></form>{% endif %}{% endif %}</td></tr>
 {% else %}<tr><td colspan="7">No requests.</td></tr>{% endfor %}</table></div></div>{% endmacro %}
 {% macro calendar(weeks, days, title, prev, next, tab) %}<div class="card"><h2>Booking Calendar</h2>
 <div style="display:flex;justify-content:space-between;align-items:center"><a class="btn s" href="{{ url_for('dashboard', tab=tab, m=prev) }}">&lsaquo;</a><b>{{ title }}</b><a class="btn s" href="{{ url_for('dashboard', tab=tab, m=next) }}">&rsaquo;</a></div>
 <table class="cal" style="margin-top:8px"><tr>{% for d in ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] %}<th>{{ d }}</th>{% endfor %}</tr>
-{% for w in weeks %}<tr>{% for d in w %}<td>{% if d %}{{ d }}{% for r in days.get(d, []) %}<i class="{{ r.status }}" title="{{ r.event }} ({{ r.t1 }}-{{ r.t2 }}): {{ r.res }}">{{ r.t1 }} {{ r.res }}</i>{% endfor %}{% endif %}</td>{% endfor %}</tr>{% endfor %}</table>
+{% for w in weeks %}<tr>{% for d in w %}<td>{% if d %}{{ d }}{% for r in days.get(d, []) %}<i class="{{ r.status }}" title="{{ r.event }}: {{ r.event_date|dfmt }} {{ r.t1|t12 }} to {{ r.rd|dfmt }} {{ r.t2|t12 }} - {{ r.res }}">{{ r.lbl }}</i>{% endfor %}{% endif %}</td>{% endfor %}</tr>{% endfor %}</table>
 <p class="mu">Navy = Approved &middot; Gold = Pending. Hover an entry for details.</p></div>{% endmacro %}"""
 T["login.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.html' as m %}<form class="card auth" method="post"><h2>Sign In</h2>{{ m.token() }}
 <label>Username</label><input name="username" value="{{ v.get('username', '') }}" autofocus>{{ m.fe(e, 'username') }}
@@ -678,19 +728,20 @@ T["account.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macro
 <button>Update Password</button>{% if not g.user.must_change %}<a class="btn s" href="{{ url_for('dashboard') }}">Cancel</a>{% endif %}</form>
 {% if g.user.must_change %}<form class="in" method="post" action="{{ url_for('logout') }}" style="display:block;text-align:center"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="s">Sign out</button></form>{% endif %}{% endblock %}"""
 T["student.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.html' as m %}
-{{ m.tabs([('new','New Request'),('mine','My Requests (' ~ mine|length ~ ')'),('cal','Calendar')], tab) }}
+{{ m.side([('new','New Request',none),('mine','My Requests',mine|length),('cal','Calendar',none)], tab) }}
 {% if tab == 'new' %}{% if summary %}<div class="msg err">{{ summary }}</div>{% endif %}
 <form class="card" method="post" action="{{ url_for('new_request') }}"><h2>Request for Facility/Equipment Use</h2>{{ m.token() }}<div class="g">
 <div><label>Requester's name *</label><input name="requester" value="{{ v.requester if 'requester' in v else g.user.fullname }}">{{ m.fe(e, 'requester') }}</div><div><label>Date</label><input value="{{ today }}" disabled></div>
 <div><label>College/Department *</label><input name="dept" value="{{ v.get('dept', '') }}">{{ m.fe(e, 'dept') }}</div><div><label>Name/Type of event *</label><input name="event" value="{{ v.get('event', '') }}">{{ m.fe(e, 'event') }}</div>
-<div><label>Date of the event *</label><input id="ed" name="event_date" type="date" min="{{ today }}" value="{{ v.get('event_date', '') }}">{{ m.fe(e, 'event_date') }}</div>
-<div><label>Estimated attendees (optional)</label><input name="attendees" type="number" min="0" value="{{ v.get('attendees', '') }}">{{ m.fe(e, 'attendees') }}</div>
-<div><label>Time reserved - from *</label><input id="t1" name="t1" type="time" value="{{ v.get('t1', '') }}">{{ m.fe(e, 't1') }}</div><div><label>to *</label><input id="t2" name="t2" type="time" value="{{ v.get('t2', '') }}">{{ m.fe(e, 't2') }}</div></div>
+<div><label>Date of the event (start) *</label><input id="ed" name="event_date" type="date" min="{{ today }}" value="{{ v.get('event_date', '') }}">{{ m.fe(e, 'event_date') }}</div>
+<div><label>Return date (when the items/facility will be returned) *</label><input id="rd" name="return_date" type="date" min="{{ today }}" value="{{ v.get('return_date', '') }}">{{ m.fe(e, 'return_date') }}</div>
+<div><label>Start time (AM/PM) *</label><input id="t1" name="t1" type="time" value="{{ v.get('t1', '') }}">{{ m.fe(e, 't1') }}</div><div><label>Return time (AM/PM) *</label><input id="t2" name="t2" type="time" value="{{ v.get('t2', '') }}">{{ m.fe(e, 't2') }}</div>
+<div><label>Estimated attendees (optional)</label><input name="attendees" type="number" min="0" value="{{ v.get('attendees', '') }}">{{ m.fe(e, 'attendees') }}</div></div>
 <label>Facility to be used</label><div class="ck">{% for f in facilities %}<label><input type="checkbox" class="fc" name="fac" value="{{ f }}"><span>{{ f }}</span></label>{% endfor %}</div>
 <input name="fac_other" placeholder="Others (specify)" value="{{ v.get('fac_other', '') }}">{{ m.fe(e, 'fac') }}
 <label>Equipment</label>{% if not inv %}<p class="mu" style="margin:0 0 6px">The admin has not listed any equipment yet. Choose "Other" and type the equipment you need.</p>{% endif %}<div id="eq"></div><button type="button" class="s" onclick="addEq()">+ Add equipment</button>{{ m.fe(e, 'eq') }}
 <label>Requested by (College Department/Department Head) - optional</label><input name="head" value="{{ v.get('head', '') }}">
-<p class="mu">Note: The requester is responsible for any damages. Please attach a valid I.D. and contact number when the form is printed. Facilities and equipment that are booked, or borrowed and not yet returned, are marked BOOKED / OUT OF STOCK. Pick the event date and time to see availability for that slot.</p>
+<p class="mu">Note: The requester is responsible for any damages. Please attach a valid I.D. and contact number when the form is printed. Facilities and equipment that are booked, or borrowed and not yet returned, are marked BOOKED / OUT OF STOCK. Pick the event dates and times to see availability for that period.</p>
 <button>Submit Request</button></form>
 <script>
 const INV={{ inv|tojson }},OLD_ITEMS={{ old_items|tojson }},OLD_FAC={{ old_fac|tojson }},HAS_ERR={{ 'true' if e else 'false' }};
@@ -700,7 +751,7 @@ function addEq(name,qty,other){const d=document.createElement('div');d.className
  $('#eq').appendChild(d);const s=d.querySelector('select');
  if(name!==undefined){s.value=[...s.options].some(o=>o.value===name)?name:'__other';d.querySelector('[name=item_qty]').value=qty;d.querySelector('[name=item_other]').value=other||''}
  else if(!INV.length)s.value='__other';paint()}
-async function refresh(){try{AV=await (await fetch('/api/availability?d='+$('#ed').value+'&t1='+$('#t1').value+'&t2='+$('#t2').value)).json()}catch(e){}READY=true;paint()}
+async function refresh(){try{AV=await (await fetch('/api/availability?d='+$('#ed').value+'&rd='+$('#rd').value+'&t1='+$('#t1').value+'&t2='+$('#t2').value)).json()}catch(e){}READY=true;paint()}
 function paint(){if(!READY)return;
  document.querySelectorAll('.fc').forEach(c=>{const b=AV.booked.includes(c.value.toLowerCase());c.disabled=b;if(b)c.checked=false;c.nextElementSibling.textContent=c.value+(b?' - BOOKED':'')});
  document.querySelectorAll('.erow').forEach(r=>{const s=r.querySelector('select'),q=r.querySelector('[name=item_qty]');
@@ -708,15 +759,26 @@ function paint(){if(!READY)return;
   if(s.selectedOptions[0].disabled){const f=[...s.options].find(o=>!o.disabled);if(f)s.value=f.value}
   const oth=s.value==='__other';r.querySelector('[name=item_other]').style.display=oth?'block':'none';
   if(oth)q.removeAttribute('max');else{const l=AV.left[s.value]||0;q.max=l;if(q.value!==''&&+q.value>l)q.value=Math.max(l,1)}})}
+function mkTime(inp){inp.type='hidden';const w=document.createElement('div');w.className='tp';
+ const H=document.createElement('select'),M=document.createElement('select'),P=document.createElement('select');
+ H.innerHTML='<option value="">Hour</option>'+[...Array(12)].map((_,i)=>'<option>'+(i+1)+'</option>').join('');
+ M.innerHTML='<option value="">Min</option>'+[...Array(12)].map((_,i)=>'<option>'+('0'+i*5).slice(-2)+'</option>').join('');
+ P.innerHTML='<option>AM</option><option>PM</option>';[H,M,P].forEach(x=>w.appendChild(x));inp.parentNode.insertBefore(w,inp.nextSibling);
+ const v=inp.value;if(/^[0-9][0-9]:[0-9][0-9]$/.test(v)){let h=+v.slice(0,2);const m=v.slice(3);P.value=h>=12?'PM':'AM';h=h%12||12;H.value=String(h);
+  if(![...M.options].some(o=>o.value===m)){const o=document.createElement('option');o.textContent=m;M.appendChild(o)}M.value=m}
+ const sync=()=>{let val='';if(H.value&&M.value!==''){let h=+H.value%12;if(P.value==='PM')h+=12;val=('0'+h).slice(-2)+':'+M.value}
+  if(inp.value!==val){inp.value=val;inp.dispatchEvent(new Event('change',{bubbles:true}))}};[H,M,P].forEach(x=>x.onchange=sync)}
+document.querySelectorAll('input[type=time]').forEach(mkTime);
+$('#ed').addEventListener('change',()=>{const r=$('#rd');r.min=$('#ed').value;if(!r.value||r.value<$('#ed').value)r.value=$('#ed').value});
 (async()=>{await refresh();document.querySelectorAll('.fc').forEach(c=>{if(OLD_FAC.includes(c.value)&&!c.disabled)c.checked=true});
  if(HAS_ERR&&OLD_ITEMS.length)OLD_ITEMS.forEach(x=>addEq(x[0],x[1],x[2]));else addEq();
- ['ed','t1','t2'].forEach(i=>$('#'+i).addEventListener('change',refresh))})();
+ ['ed','rd','t1','t2'].forEach(i=>$('#'+i).addEventListener('change',refresh))})();
 </script>
-{% elif tab == 'mine' %}{{ m.table(mine) }}
+{% elif tab == 'mine' %}{{ m.table(mine, False, '', 'My Requests') }}
 {% else %}{{ m.calendar(weeks, days, title, prev, next, 'cal') }}{% endif %}{% endblock %}"""
 T["admin.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.html' as m %}
-{{ m.tabs([('pending','Pending (' ~ cnt.pending ~ ')'),('approved','Approved (' ~ cnt.approved ~ ')'),('returned','Returned (' ~ cnt.returned ~ ')'),('disapproved','Disapproved (' ~ cnt.disapproved ~ ')'),('cal','Calendar'),('stock','Equipment Stock'),('users','Users')], tab) }}
-{% if tab in ('pending','approved','returned','disapproved') %}{% if tab == 'approved' %}<p class="mu">Approved requests stay here until you click <b>Mark Returned</b>. Unreturned items stay out of stock, even after the event date.</p>{% endif %}{{ m.table(rows, True, tab) }}
+{{ m.side([('pending','Pending',cnt.pending),('approved','Approved',cnt.approved),('returned','Returned',cnt.returned),('disapproved','Disapproved',cnt.disapproved),('cal','Calendar',none),('stock','Equipment Stock',none),('users','Users',none)], tab) }}
+{% if tab in ('pending','approved','returned','disapproved') %}{% if tab == 'approved' %}<p class="mu">Approved requests stay here until you click <b>Mark Returned</b>. Unreturned items stay out of stock, even after the event date.</p>{% endif %}{{ m.table(rows, True, tab, {'pending': 'Pending Requests', 'approved': 'Approved - Not Yet Returned', 'returned': 'Returned', 'disapproved': 'Disapproved'}[tab]) }}
 {% elif tab == 'cal' %}{{ m.calendar(weeks, days, title, prev, next, 'cal') }}
 {% elif tab == 'stock' %}<div class="card"><h2>Equipment Stock</h2><p class="mu">You decide which equipment students can borrow and how many you own. Students cannot borrow more than what is left for their chosen date and time. "Out now" = approved and not yet returned.</p>
 {% if inv %}<div class="tb"><table><tr><th>Equipment</th><th>Out now (not returned)</th><th>Available now</th><th>Total stock</th></tr>{% for i in inv %}
@@ -727,6 +789,7 @@ T["admin.html"] = """{% extends 'base.html' %}{% block body %}{% import 'macros.
 <tr><td>{{ u.fullname }}</td><td>{{ u.student_no }}</td><td>{{ u.username }}</td><td>{{ u.role }}</td><td>{% if u.id != g.user.id %}<form class="in" method="post" action="{{ url_for('admin_reset_user', uid=u.id) }}" onsubmit="return confirm('Reset password for {{ u.username }}?')">{{ m.token() }}<button class="sm">Reset password</button></form>{% endif %}</td></tr>{% endfor %}</table></div></div>{% endif %}{% endblock %}"""
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["csrf"] = csrf
+app.jinja_env.filters.update(t12=t12, dfmt=dfmt, dt12=dt12)
 
 init_db()
 
