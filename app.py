@@ -1031,566 +1031,733 @@ app.jinja_env.globals["ICONS"] = ICONS
 
 init_db()
 
+# =====================================================================================================================
+# ADDED MODULE - ONLINE DAMAGE-REPORT SYSTEM (everything below is new; nothing above this line was changed)
+#   Public (no login):  small "Report broken equipment" button on the sign-in page ->
+#                       /report      report form        /report/done   confirmation        /report/track   check status
+#   GSO admin:          /gso         separate Damage Reports dashboard (same admin account as the facility dashboard)
+#   Optional e-mail alerts: set GSO_NOTIFY_EMAIL (+ SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, APP_URL)
+# =====================================================================================================================
+import smtplib, threading
+from email.message import EmailMessage
 
-# NEW ADD-ON: GSO ONLINE DAMAGE-REPORT SYSTEM (original code above is untouched)
-from functools import wraps
-def _gso_t12(t):
-    try: return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
-    except Exception: return t or ""
-def _gso_dfmt(d):
-    try: return datetime.strptime((d or "")[:10], "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
-    except Exception: return d or ""
-def _gso_dt12(s_):
-    s_ = s_ or ""
-    return (_gso_dfmt(s_[:10]) + " " + _gso_t12(s_[11:16])).strip()
-app.jinja_env.filters.update(t12=_gso_t12, dfmt=_gso_dfmt, dt12=_gso_dt12)
-app.jinja_env.globals["csrf"] = csrf
-# 2. NEW DATABASE TABLES (original tables untouched)
-# ---------------------------------------------------------------------------
-REPORT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS damage_reports(
-  id INTEGER PRIMARY KEY, report_no TEXT UNIQUE NOT NULL,
-  reporter TEXT NOT NULL, contact TEXT NOT NULL, dept TEXT,
-  location TEXT NOT NULL, item_name TEXT NOT NULL, category TEXT NOT NULL,
-  severity TEXT NOT NULL, description TEXT NOT NULL, photo TEXT,
-  status TEXT NOT NULL DEFAULT 'Received',
-  admin_remarks TEXT DEFAULT '', created_at TEXT NOT NULL,
-  updated_at TEXT, resolved_at TEXT);
-CREATE TABLE IF NOT EXISTS report_timeline(
-  id INTEGER PRIMARY KEY, report_id INTEGER NOT NULL,
-  status TEXT NOT NULL, remarks TEXT, by_user TEXT, created_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_dr_status   ON damage_reports(status);
-CREATE INDEX IF NOT EXISTS idx_dr_severity ON damage_reports(severity);
-"""
-def _exec_schema(sql):
-    if USE_PG:
-        sql = sql.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY")
-        cur = db().c.cursor()
-        for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
-            cur.execute(stmt)
-        db().commit()
-    else:
-        db().executescript(sql)
-with app.app_context():
-    _exec_schema(REPORT_SCHEMA)
-
-# ---------------------------------------------------------------------------
-# 3. SMALL HELPERS FOR THE NEW SYSTEM
-# ---------------------------------------------------------------------------
-SEVERITIES = ["Minor", "Moderate", "Severe", "Urgent / Hazard"]
-STATUSES   = ["Received", "In Progress", "Resolved"]
-# badge classes (defined in REPORT_CSS below)
-SEV_CLS = {"Minor":"sevMinor","Moderate":"sevModerate","Severe":"sevSevere","Urgent / Hazard":"sevUrgent"}
-ST_CLS  = {"Received":"stReceived","In Progress":"stInProgress","Resolved":"stResolved"}
-
-def next_report_no():
-    y = int(now_s()[:4])   # current year from "YYYY-MM-DD HH:MM" (no now_dt dependency)
-    r = q1("SELECT COUNT(*) c FROM damage_reports WHERE report_no LIKE ?", "GSO-%d-%%%%" % y)
-    n = (r[0] if r else 0) + 1
-    while True:
-        no = "GSO-%d-%04d" % (y, n)
-        if not q1("SELECT 1 FROM damage_reports WHERE report_no=?", no):
-            return no
-        n += 1
-
-def _decorate(row):
-    """Add badge-class helper fields to a row dict."""
-    d = dict(row)
-    d["sev_cls"] = SEV_CLS.get(d["severity"], "sevMinor")
-    d["st_cls"]  = ST_CLS.get(d["status"], "stReceived")
-    return d
-
-# admin-only decorator that passes ?next= so admin lands straight on /gso after login
-def gso_admin(f):
-    @wraps(f)
-    def w(*a, **k):
-        if not g.user:
-            return redirect(url_for("login", next=request.path))
-        if g.user["role"] != "admin":
-            abort(403)
-        return f(*a, **k)
-    return w
-
-# ---------------------------------------------------------------------------
-# 4. WRAP LOGIN so it respects ?next= (original login code untouched; in-memory wrap only)
-#    After a successful login the original always redirects to /dashboard; if a ?next=
-#    was given (e.g. /login?next=/gso) we send the admin there instead.
-# ---------------------------------------------------------------------------
-_orig_login = app.view_functions["login"]
-def _login_wrap():
-    # capture ?next= BEFORE calling original login (it does session.clear() on success,
-    # which would wipe anything stored in session). The login form has no action= attribute,
-    # so the browser posts back to the same URL, preserving ?next=/gso in request.args.
-    nxt = request.values.get("next", "")
-    if request.method == "GET" and nxt:
-        session["after_login"] = nxt
-    if request.method == "POST":
-        nxt = nxt or session.get("after_login", "")
-    resp = _orig_login()
-    if request.method == "POST" and resp.status_code in (302, 303) and nxt and nxt.startswith("/"):
-        resp.location = nxt
-        session.pop("after_login", None)
-    return resp
-app.view_functions["login"] = _login_wrap
-
-# ---------------------------------------------------------------------------
-# 5. The original "/" route (endpoint "home", @login_required) only redirected
-#    users to /dashboard. We keep the "/" URL rule EXACTLY as-is (no url_map
-#    surgery) and simply swap in our PUBLIC portal view for endpoint "home".
-#    /dashboard itself stays 100% untouched; only the public front page changes.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 6. SHARED CSS FOR THE NEW PAGES (matches school header; report system uses a
-#    warm red/amber accent so it visually differs from the facility system).
-# ---------------------------------------------------------------------------
-REPORT_CSS = """
-:root{--bg:#f3f5f9;--card:#fff;--tx:#1b2333;--mu:#5d6779;--pr:#14417b;--ac:#c9a227;--bd:#d9dfe9;--rep:#a63232;--rep2:#7c2020}
-*{box-sizing:border-box}body{margin:0;background:transparent;color:var(--tx);font:15px/1.5 system-ui,Segoe UI,Arial,sans-serif}
-header{background:#b7e4c7;color:#1b4332;border-bottom:4px solid #74c69d;padding:10px clamp(8px,2vw,22px);display:flex;flex-wrap:nowrap;justify-content:center;align-items:center;gap:clamp(6px,1.5vw,14px)}
-header img{height:clamp(34px,8vw,62px);width:auto;display:block;flex:none}.ht{text-align:center;min-width:0;flex:0 1 auto}
-header h1{font:600 clamp(11px,2.5vw,19px)/1.25 Georgia,serif;margin:0}header small{opacity:.85;display:block;font-size:clamp(9px,1.8vw,13px);line-height:1.3;margin-top:2px}
-.wrap{max-width:980px;margin:22px auto;padding:0 16px}.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:22px;margin-bottom:18px}
-h2{font:600 19px Georgia,serif;margin:0 0 14px;color:var(--pr)}h2.rep{color:var(--rep)}
-label{display:block;font-size:13px;color:var(--mu);margin:10px 0 3px}
-input,select,textarea{width:100%;padding:9px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit}
-textarea{min-height:90px;resize:vertical}
-button,.btn{background:var(--pr);color:#fff;border:0;padding:9px 16px;border-radius:6px;font:600 14px inherit;cursor:pointer;margin:8px 6px 0 0;text-decoration:none;display:inline-block}
-button.s,.btn.s{background:transparent;color:var(--pr);border:1px solid var(--pr)}
-button.r,.btn.r{background:var(--rep)}button.gr,.btn.gr{background:#2b7a47}
-a{color:var(--pr)}.mu{color:var(--mu);font-size:12px}.fe{color:#c0392b;font-size:12.5px;margin-top:3px}
-.msg{padding:10px 14px;border-radius:6px;margin-bottom:14px}.msg.err{background:#f8d7d7;color:#8e2323}.msg.ok{background:#d5f0de;color:#1e6b3a}
-table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--bd);vertical-align:top}th{color:var(--mu);font-weight:600}.tb{overflow-x:auto}
-.b{padding:2px 9px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap}
-.sevMinor{background:#e7f0ff;color:#14417b}.sevModerate{background:#fff1c9;color:#7a5a00}.sevSevere{background:#fde2cd;color:#8a4410}.sevUrgent{background:#f8d7d7;color:#8e2323}
-.stReceived{background:#fff1c9;color:#7a5a00}.stInProgress{background:#dbe7fb;color:#14417b}.stResolved{background:#d5f0de;color:#1e6b3a}
-.tabs{display:flex;flex-wrap:wrap;margin-bottom:14px}.tabs a{margin:0 6px 6px 0;padding:8px 14px;border:1px solid var(--rep);border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;color:var(--rep)}.tabs a.on{background:var(--rep);color:#fff}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}@media(max-width:700px){.stats{grid-template-columns:repeat(2,1fr)}}
-.stat{background:#fff;border:1px solid var(--bd);border-radius:10px;padding:14px 16px;border-top:4px solid var(--pr)}
-.stat .n{font:700 26px Georgia,serif;color:var(--pr)}.stat .l{font-size:12px;color:var(--mu)}
-.stat.r{border-top-color:var(--rep)}.stat.r .n{color:var(--rep)}.stat.a{border-top-color:#c9a227}.stat.a .n{color:#8a6d10}.stat.g{border-top-color:#2b7a47}.stat.g .n{color:#2b7a47}
-.topbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}.topbar .sp{flex:1}
-.repbanner{background:linear-gradient(135deg,#a63232,#7c2020);color:#fff;border-radius:10px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.repbanner b{font:700 18px Georgia,serif}.repbanner .sp{flex:1}.repbanner a,.repbanner button{background:#fff;color:var(--rep);border:0;padding:6px 12px;border-radius:6px;font-weight:600;font-size:13px;text-decoration:none;cursor:pointer}
-.portal{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:18px 0}@media(max-width:700px){.portal{grid-template-columns:1fr}}
-.pcard{display:block;text-decoration:none;background:#fff;border:2px solid var(--bd);border-radius:14px;padding:28px 24px;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;color:var(--tx)}
-.pcard:hover{transform:translateY(-4px);box-shadow:0 12px 26px rgba(20,65,123,.22)}.pcard.fac{border-color:#14417b}.pcard.rep{border-color:#a63232}
-.pcard .ic{width:52px;height:52px;border-radius:12px;display:grid;place-items:center;margin-bottom:12px;color:#fff}
-.pcard.fac .ic{background:linear-gradient(135deg,#14417b,#2a63b8)}.pcard.rep .ic{background:linear-gradient(135deg,#a63232,#c45050)}
-.pcard .ic svg{width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.pcard h3{margin:0 0 6px;font:700 19px Georgia,serif}.pcard.fac h3{color:#14417b}.pcard.rep h3{color:#a63232}
-.pcard p{margin:0;color:var(--mu);font-size:13.5px}
-.minilinks{text-align:center;margin:14px 0 4px}.minilinks a{margin:0 10px;font-size:13.5px}
-.rno{font:700 clamp(20px,5vw,32px) Georgia,serif;color:var(--rep);letter-spacing:1px;background:#fdecea;border:1px dashed var(--rep);border-radius:8px;padding:10px 16px;display:inline-block;margin:8px 0}
-.tl{border-left:3px solid var(--bd);margin-left:6px;padding-left:16px}.tl .ev{position:relative;margin-bottom:14px}.tl .ev::before{content:'';position:absolute;left:-22px;top:5px;width:11px;height:11px;border-radius:50%;background:var(--pr);border:2px solid #fff}
-.photobox{max-width:340px;border:1px solid var(--bd);border-radius:8px;padding:6px;background:#fff}.photobox img{width:100%;border-radius:6px;display:block}
-.kv{display:grid;grid-template-columns:160px 1fr;gap:6px 14px;font-size:14px}@media(max-width:600px){.kv{grid-template-columns:1fr}}.kv .k{color:var(--mu);font-size:12.5px;padding-top:2px}
-form.inline{display:inline}
-@media print{.noprint{display:none!important}body{background:#fff}.card{border:0;padding:0}}body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background:linear-gradient(rgba(243,245,249,.88),rgba(243,245,249,.88)),url('/bg.jpg') center/cover no-repeat;z-index:-1;pointer-events:none}
+RP_STATUSES = ("New", "In Progress", "Resolved", "Rejected")
+RP_WHERE = {"new": "status='New'", "progress": "status='In Progress'", "resolved": "status='Resolved'",
+            "rejected": "status='Rejected'", "all": "1=1"}
+RP_TITLES = {"new": "New reports", "progress": "In progress", "resolved": "Resolved reports", "rejected": "Rejected / closed reports",
+             "all": "All reports", "summary": "Summary"}
+RP_PROBLEMS = ["Broken / damaged", "Not working", "Missing parts", "Leaking / electrical / safety hazard", "Other"]
+RP_COMMON = ["Chair", "Table", "Projector", "Microphone", "Sound system", "Aircon", "Electric fan", "Computer", "Light / bulb",
+             "Door / lock", "Window", "Faucet / plumbing", "Whiteboard", "Extension cord"]
+RP_MAX_PHOTO = 4 * 1024 * 1024
+RP_COLS = ("id,ticket,token,reporter,contact,dept,item,location,problem,urgent,description,photo_type,status,created_at,"
+           "updated_at,resolved_at,(photo IS NOT NULL) AS has_photo")
+RP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS damage_reports(id INTEGER PRIMARY KEY, ticket TEXT, token TEXT UNIQUE NOT NULL, reporter TEXT NOT NULL,
+  contact TEXT, dept TEXT, item TEXT NOT NULL, location TEXT NOT NULL, problem TEXT, urgent INTEGER DEFAULT 0, description TEXT NOT NULL,
+  photo TEXT, photo_type TEXT, status TEXT DEFAULT 'New', created_at TEXT, updated_at TEXT, resolved_at TEXT);
+CREATE TABLE IF NOT EXISTS damage_updates(id INTEGER PRIMARY KEY, report_id INTEGER NOT NULL REFERENCES damage_reports(id) ON DELETE CASCADE,
+  status TEXT, note TEXT, public INTEGER DEFAULT 1, by_name TEXT, created_at TEXT);
 """
 
-# common header (school logos + title) used by the new public pages
-_HEADER = """<header><img src="/logo/1.png" alt="SLSU">
-<div class="ht"><h1>Southern Luzon State University - Judge Guillermo Eleazar</h1>
-<small>General Services Office (GSO) - Online Services</small></div>
-<img src="/logo/2.png" alt="SLSU-JGE"></header>"""
-
-_FLASH = """{% for c, m in get_flashed_messages(with_categories=true) %}<div class="msg {{ c }}">{{ m }}</div>{% endfor %}"""
-
-# ---------------------------------------------------------------------------
-# 7. NEW TEMPLATES (added to T; original template keys untouched)
-# ---------------------------------------------------------------------------
-T["portal.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Dashboard — SLSU-JGE GSO</title><style></style></head><body>
-<header><img src="/logo/1.png" alt="SLSU">
-<div class="ht"><h1>Southern Luzon State University - Judge Guillermo Eleazar</h1>
-<small>General Services Office (GSO) - Admin Dashboard</small></div>
-<img src="/logo/2.png" alt="SLSU-JGE"></header>
-<div class="wrap" style="max-width:760px">
-<div class="card" style="text-align:center;margin-top:18px">
-<h2>Welcome, {{ g.user.fullname }} (Admin)</h2>
-<p class="mu">Choose which dashboard to open. Both use the same admin account.</p>
-</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px">
-<a href="/dashboard" style="display:block;text-decoration:none;background:#fff;border:2px solid #14417b;border-radius:12px;padding:24px;text-align:center;color:#14417b">
-<div style="font-size:34px;margin-bottom:8px">&#128197;</div>
-<h3 style="margin:0 0 6px">Facility &amp; Equipment</h3>
-<p style="margin:0;color:#5d6779;font-size:13px">Scheduling, requests, inventory, reports</p>
-</a>
-<a href="/gso" style="display:block;text-decoration:none;background:#fff;border:2px solid #a63232;border-radius:12px;padding:24px;text-align:center;color:#a63232">
-<div style="font-size:34px;margin-bottom:8px">&#128295;</div>
-<h3 style="margin:0 0 6px">GSO Damage Reports</h3>
-<p style="margin:0;color:#5d6779;font-size:13px">Review &amp; resolve damage reports</p>
-</a>
-</div>
-<div style="text-align:center">
-<form method="post" action="/logout" style="display:inline">
-<input type="hidden" name="_csrf" value="{{ csrf() }}">
-<button class="btn s" style="padding:6px 14px;font-size:13px">Sign out</button>
-</form>
-</div>
-</div></body></html>"""
-
-T["report_form.html"] = """<!doctype html><html lang="fil"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Report Damaged Item - GSO</title><style>""" + REPORT_CSS + """</style></head><body>
-""" + _HEADER + """<div class="wrap" style="max-width:680px">""" + _FLASH + """
-<p><a href="/">&larr; Back to home</a></p>
-<div class="card">
-<h2 class="rep">Report Damaged Item / Facility</h2>
-<p class="mu">Fill out the form below. <b>No account or login needed.</b> You will receive a <b>Report Number</b> after submission — save it for follow-up.</p>
-<form method="post" enctype="multipart/form-data">
-<input type="hidden" name="_csrf" value="{{ csrf() }}">
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 14px" class="gcols">
-  <div><label>Your Full Name *</label><input name="reporter" value="{{ v.reporter }}" required>{% if e.reporter %}<div class="fe">{{ e.reporter }}</div>{% endif %}</div>
-  <div><label>Contact number (cellphone) *</label><input name="contact" value="{{ v.contact }}" placeholder="09xx xxx xxxx" required>{% if e.contact %}<div class="fe">{{ e.contact }}</div>{% endif %}</div>
-</div>
-<label>Department / Course / Office (optional)</label><input name="dept" value="{{ v.dept }}">
-<label>Location * <span class="mu">(building, floor, room)</span></label>
-<input name="location" value="{{ v.location }}" list="loclist" placeholder="e.g. AVR, 2nd Floor Admin Bldg, Room 103" required>
-<datalist id="loclist"><option>Admin Building</option><option>Audio Visual Room (AVR)</option><option>Covered Court</option><option>Classroom</option><option>Library</option><option>Comfort Room (CR)</option><option>Office</option><option>Corridor</option></datalist>
-{% if e.location %}<div class="fe">{{ e.location }}</div>{% endif %}
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 14px" class="gcols">
-  <div><label>Category *</label>
-    <select name="category" required>
-      <option value="">-- select --</option>
-      <option {% if v.category=='Equipment' %}selected{% endif %}>Equipment</option>
-      <option {% if v.category=='Facility / Building Part' %}selected{% endif %}>Facility / Building Part</option>
-    </select>{% if e.category %}<div class="fe">{{ e.category }}</div>{% endif %}</div>
-  <div><label>Severity / Urgency *</label>
-    <select name="severity" required>
-      <option value="">-- select --</option>
-      {% for s in severities %}<option {% if v.severity==s %}selected{% endif %}>{{ s }}</option>{% endfor %}
-    </select>{% if e.severity %}<div class="fe">{{ e.severity }}</div>{% endif %}</div>
-</div>
-<label>Item / Facility Part Damaged *</label>
-<input name="item_name" value="{{ v.item_name }}" list="itemlist" placeholder="e.g. Projector, Electric Fan, Chair, Door, Light, Faucet, Aircon" required>
-<datalist id="itemlist"><option>Projector</option><option>Television / TV</option><option>Speaker / Sound System</option><option>Microphone</option><option>Electric Fan</option><option>Aircon</option><option>Computer / CPU</option><option>Chair</option><option>Table</option><option>Door</option><option>Window</option><option>Light bulb</option><option>Electrical Outlet</option><option>Faucet</option><option>Comfort Room / Toilet</option><option>Ceiling</option><option>Floor</option></datalist>
-{% if e.item_name %}<div class="fe">{{ e.item_name }}</div>{% endif %}
-<label>Description of Damage * <span class="mu">(what is broken, how it happened if known)</span></label>
-<textarea name="description" required placeholder="e.g. Projector no longer turns on and emits a burning smell when plugged in.">{{ v.description }}</textarea>
-{% if e.description %}<div class="fe">{{ e.description }}</div>{% endif %}
-<label>Photo of damage <span class="mu">(optional, max 2MB)</span></label>
-<input type="file" name="photo" accept="image/*">
-<p class="mu">After submission, your <b>Report Number</b> will be shown. You can check the status anytime using that number.</p>
-<button type="submit" class="r">Submit Report</button>
-<a class="btn s" href="/">Cancel</a>
-</form>
-</div></div>
-<style>@media(max-width:600px){.gcols{grid-template-columns:1fr!important}}</style>
-</body></html>"""
-
-T["report_success.html"] = """<!doctype html><html lang="fil"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Report Submitted - GSO</title><style>""" + REPORT_CSS + """</style></head><body>
-""" + _HEADER + """<div class="wrap" style="max-width:680px">""" + _FLASH + """
-<div class="card" style="text-align:center">
-<div style="width:64px;height:64px;border-radius:50%;background:#d5f0de;display:grid;place-items:center;margin:0 auto 10px"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#1e6b3a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-<h2 class="rep" style="color:#1e6b3a">Report Submitted! Thank you.</h2>
-<p class="mu">Your report has been sent to GSO. Your <b>Report Number</b> is:</p>
-<div class="rno">{{ r.report_no }}</div>
-<p class="mu">Screenshot or save this number. Use it to follow up on your report status anytime.</p>
-</div>
-<div class="card">
-<h2>Report Summary</h2>
-<div class="kv">
-<div class="k">Date filed</div><div>{{ r.created_at|dt12 }}</div>
-<div class="k">Reporter</div><div>{{ r.reporter }}</div>
-<div class="k">Location</div><div>{{ r.location }}</div>
-<div class="k">Item / Part</div><div>{{ r.item_name }} <span class="mu">({{ r.category }})</span></div>
-<div class="k">Severity</div><div><span class="b {{ r.sev_cls }}">{{ r.severity }}</span></div>
-<div class="k">Description</div><div>{{ r.description }}</div>
-</div>
-<div class="noprint" style="margin-top:16px">
-<button onclick="window.print()">Print this receipt</button>
-<a class="btn" href="/report/track">Check status</a>
-<a class="btn s" href="/report/new">Submit another report</a>
-<a class="btn s" href="/">Back to home</a>
-</div>
-</div></div></body></html>"""
-
-T["track.html"] = """<!doctype html><html lang="fil"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Check Report Status - GSO</title><style>""" + REPORT_CSS + """</style></head><body>
-""" + _HEADER + """<div class="wrap" style="max-width:680px">""" + _FLASH + """
-<p><a href="/">&larr; Back to home</a></p>
-<div class="card">
-<h2>Check Report Status</h2>
-<p class="mu">Enter your <b>Report Number</b> and the <b>contact number</b> you used when reporting.</p>
-<form method="post">
-<input type="hidden" name="_csrf" value="{{ csrf() }}">
-<label>Report Number</label><input name="report_no" value="{{ v.report_no }}" placeholder="hal. GSO-2026-0001" required>
-<label>Contact number</label><input name="contact" value="{{ v.contact }}" placeholder="09xx xxx xxxx" required>
-<button type="submit">Find Report</button>
-</form>
-</div>
-{% if r %}
-<div class="card">
-<h2>Report: {{ r.report_no }}</h2>
-<p>Current status: <span class="b {{ r.st_cls }}">{{ r.status }}</span>
-{% if r.status=='Resolved' and r.resolved_at %}<br><span class="mu">Resolved on: {{ r.resolved_at|dt12 }}</span>{% endif %}</p>
-<div class="kv">
-<div class="k">Date filed</div><div>{{ r.created_at|dt12 }}</div>
-<div class="k">Location</div><div>{{ r.location }}</div>
-<div class="k">Item</div><div>{{ r.item_name }}</div>
-<div class="k">Severity</div><div><span class="b {{ r.sev_cls }}">{{ r.severity }}</span></div>
-<div class="k">GSO remarks</div><div>{{ r.admin_remarks or 'No updates yet. GSO review pending.' }}</div>
-</div>
-{% if tl %}
-<h3 style="margin-top:18px;font-size:15px">Update history</h3>
-<div class="tl">{% for t in tl %}<div class="ev"><b>{{ t.status }}</b> <span class="mu">— {{ t.created_at|dt12 }}</span>{% if t.remarks %}<br><span class="mu">{{ t.remarks }}</span>{% endif %}</div>{% endfor %}</div>
-{% endif %}
-</div>
-{% elif posted %}
-<div class="msg err">Report not found. Please check your Report Number and contact number.</div>
-{% endif %}
-</div></body></html>"""
-
-T["gso_dash.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GSO Damage Report System — Admin</title><style>""" + REPORT_CSS + """</style></head><body>
-""" + _HEADER + """<div class="wrap">""" + _FLASH + """
-<div class="repbanner"><b>GSO DAMAGE REPORT SYSTEM — Admin Dashboard</b><span class="mu" style="color:#ffd9d9">(separate from Facility &amp; Equipment System)</span><span class="sp"></span>
-<a href="/dashboard">Facility &amp; Equipment Dashboard &rarr;</a>
-<a href="/gso/export.csv">Export CSV</a>
-<form class="inline" method="post" action="/logout"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button>Logout</button></form>
-</div>
-<div class="stats">
-<div class="stat r"><div class="n">{{ cnt.Received }}</div><div class="l">New / Received</div></div>
-<div class="stat a"><div class="n">{{ cnt['In Progress'] }}</div><div class="l">In Progress</div></div>
-<div class="stat g"><div class="n">{{ cnt.Resolved }}</div><div class="l">Resolved</div></div>
-<div class="stat r"><div class="n">{{ cnt.Urgent }}</div><div class="l">Urgent / Hazard (open)</div></div>
-</div>
-<div class="tabs">
-{% for t in tabs %}<a class="{{ 'on' if tab==t.k }}" href="/gso?tab={{ t.k }}">{{ t.label }}{% if t.n is not none and t.n>0 %} ({{ t.n }}){% endif %}</a>{% endfor %}
-</div>
-<div class="card"><div class="tb"><table>
-<tr><th>Report No.</th><th>Date</th><th>Reporter</th><th>Item</th><th>Location</th><th>Severity</th><th>Status</th><th></th></tr>
-{% for r in rows %}<tr>
-<td><b>{{ r.report_no }}</b></td>
-<td class="mu">{{ r.created_at|dt12 }}</td>
-<td>{{ r.reporter }}<br><span class="mu">{{ r.contact }}</span></td>
-<td>{{ r.item_name }}<br><span class="mu">{{ r.category }}</span></td>
-<td>{{ r.location }}</td>
-<td><span class="b {{ r.sev_cls }}">{{ r.severity }}</span></td>
-<td><span class="b {{ r.st_cls }}">{{ r.status }}</span></td>
-<td><a class="btn s" style="padding:4px 10px;font-size:12px;margin:0" href="/gso/report/{{ r.id }}">View</a></td>
-</tr>{% else %}<tr><td colspan="8" class="mu">No reports in this category.</td></tr>{% endfor %}
-</table></div></div>
-</div></body></html>"""
-
-T["gso_detail.html"] = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ r.report_no }} — GSO Damage Report</title><style>""" + REPORT_CSS + """</style></head><body>
-""" + _HEADER + """<div class="wrap">""" + _FLASH + """
-<div class="repbanner"><b>GSO DAMAGE REPORT SYSTEM</b><span class="mu" style="color:#ffd9d9">Report {{ r.report_no }}</span><span class="sp"></span>
-<a href="/gso">&larr; Back to dashboard</a>
-<form class="inline" method="post" action="/logout"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button>Logout</button></form>
-</div>
-<div class="card">
-<h2 class="rep">Report {{ r.report_no }} <span class="b {{ r.st_cls }}">{{ r.status }}</span> <span class="b {{ r.sev_cls }}">{{ r.severity }}</span></h2>
-<div class="kv">
-<div class="k">Date filed</div><div>{{ r.created_at|dt12 }}</div>
-<div class="k">Reporter</div><div>{{ r.reporter }} — {{ r.contact }}</div>
-<div class="k">Dept / Office</div><div>{{ r.dept or '-' }}</div>
-<div class="k">Location</div><div>{{ r.location }}</div>
-<div class="k">Item / Part</div><div>{{ r.item_name }} <span class="mu">({{ r.category }})</span></div>
-<div class="k">Description</div><div>{{ r.description }}</div>
-{% if r.resolved_at %}<div class="k">Resolved on</div><div>{{ r.resolved_at|dt12 }}</div>{% endif %}
-{% if r.updated_at %}<div class="k">Last update</div><div>{{ r.updated_at|dt12 }}</div>{% endif %}
-</div>
-{% if r.photo %}<div style="margin-top:14px"><label style="margin:0 0 6px">Photo:</label><div class="photobox"><img src="{{ r.photo }}" alt="photo of damage"></div></div>{% endif %}
-</div>
-<div class="card">
-<h3 style="margin:0 0 10px;font-size:15px">Status timeline</h3>
-<div class="tl">{% for t in tl %}<div class="ev"><b>{{ t.status }}</b> <span class="mu">— {{ t.created_at|dt12 }}{% if t.by_user %} · {{ t.by_user }}{% endif %}</span>{% if t.remarks %}<br><span class="mu">{{ t.remarks }}</span>{% endif %}</div>{% else %}<div class="mu">No updates yet.</div>{% endfor %}</div>
-</div>
-<div class="card">
-<h3 style="margin:0 0 10px;font-size:15px">Update Status</h3>
-<form method="post" action="/gso/report/{{ r.id }}/update">
-<input type="hidden" name="_csrf" value="{{ csrf() }}">
-<label>New status</label>
-<select name="status">{% for s in statuses %}<option {% if r.status==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select>
-<label>Remarks / Action taken (visible to reporter in tracking)</label>
-<textarea name="remarks" placeholder="hal. Ipinaalam na sa maintenance, schedule ng repair sa Oct 5.">{{ r.admin_remarks }}</textarea>
-<button type="submit">Save update</button>
-<button class="gr" type="submit" name="status" value="Resolved" onclick="this.form.status.value='Resolved'">Mark as Resolved</button>
-</form>
-</div>
-</div></body></html>"""
-
-# ---------------------------------------------------------------------------
-# 8. NEW ROUTES
-# ---------------------------------------------------------------------------
-def portal():
-    # Public -> facility Sign In page. Logged-in admin -> switchboard with both
-    # dashboards (so they can always find the GSO Reports dashboard).
-    if g.user and g.user["role"] == "admin":
-        return render_template("portal.html")
-    if g.user:
-        return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
-app.view_functions["home"] = portal
-
-# Inject a small FIXED button at top-right (just below the header) into EVERY page.
-#   • Public visitors  -> "Report Damaged Item" (no login needed)  [as requested]
-#   • Logged-in admin  -> "GSO Reports" (one-click access to the GSO admin dashboard,
-#                        so admin never gets lost / "cannot enter")
-# Original base.html template source is not modified — extended in memory only.
-_fixed_btn = (
-    '<div style="position:fixed;top:78px;right:14px;z-index:100">'
-    '{% if g.user and g.user.role == "admin" %}'
-    '<a href="{{ url_for(\'gso_dashboard\') }}" '
-    'style="display:inline-block;background:#a63232;color:#fff;padding:7px 13px;'
-    'border-radius:6px;font-size:12.5px;font-weight:700;text-decoration:none;'
-    'box-shadow:0 2px 10px rgba(166,50,50,.4)">GSO Reports</a>'
-    '{% else %}'
-    '<a href="{{ url_for(\'report_new\') }}" title="Report a damaged item — no login needed" '
-    'style="display:inline-block;background:#fff;color:#a63232;border:1.5px solid #a63232;'
-    'padding:7px 13px;border-radius:6px;font-size:12.5px;font-weight:700;text-decoration:none;'
-    'box-shadow:0 2px 10px rgba(0,0,0,.2)">&#9888;&#65039; Report Damaged Item</a>'
-    '{% endif %}</div>')
-# Cross-device fixed background: original CSS uses background-attachment:fixed
-# which breaks on mobile (iOS/Android). A fixed ::before layer works on ALL devices.
-_bg_fix_css = (
-    '<style>'
-    'body.authbg,body.dash{background:#f3f5f9!important}'
-    'body.authbg::before,body.dash::before{content:\'\';position:fixed;top:0;left:0;right:0;bottom:0;'
-    'background:center/cover no-repeat;z-index:-1;pointer-events:none}'
-    'body.authbg::before{background-image:linear-gradient(rgba(255,255,255,.10),rgba(255,255,255,.10)),url(\'/bg.jpg\')}'
-    'body.dash::before{background-image:linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url(\'/bg.jpg\')}'
-    '</style>'
-)
-if "</body>" in T.get("base.html", ""):
-    T["base.html"] = T["base.html"].replace("</body>", _bg_fix_css + _fixed_btn + "</body>", 1)
-@app.route("/report/new", methods=["GET", "POST"])
-def report_new():
-    v = {k: "" for k in ("reporter","contact","dept","location","category","item_name","severity","description")}
-    e = {}
-    if request.method == "POST":
-        f = request.form
-        for k in v: v[k] = (f.get(k) or "").strip()
-        # validation
-        if len(v["reporter"]) < 2: e["reporter"] = "Please enter your name."
-        if len(v["contact"]) < 7:  e["contact"] = "Please enter your contact number."
-        if not v["location"]:      e["location"] = "Please enter the location."
-        if not v["category"]:      e["category"] = "Please select a category."
-        if not v["item_name"]:     e["item_name"] = "Please enter the damaged item."
-        if not v["severity"]:      e["severity"] = "Please select severity."
-        if len(v["description"]) < 8: e["description"] = "Description nang kaunti ang pinsala (min. 8 letra)."
-        # optional photo
-        photo_data = None
-        pf = request.files.get("photo")
-        if pf and pf.filename:
-            raw = pf.read()
-            if len(raw) > 2 * 1024 * 1024:
-                e["photo"] = "Photo too large (max 2MB)."
-            elif not (pf.mimetype or "").startswith("image/"):
-                e["photo"] = "Only image files are accepted (jpg/png)."
+def rp_init():
+    with app.app_context():
+        try:
+            if USE_PG:
+                cur = db().c.cursor(); cur.execute("SELECT pg_advisory_xact_lock(7242027)")
+                cur.execute(RP_SCHEMA.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY")
+                            + "".join("ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n" % t for t in ("damage_reports", "damage_updates")))
+                db().commit()
             else:
-                photo_data = "data:%s;base64,%s" % (pf.mimetype, base64.b64encode(raw).decode())
-        if not e:
-            no = next_report_no()
-            ex("""INSERT INTO damage_reports(report_no,reporter,contact,dept,location,item_name,category,
-                severity,description,photo,status,admin_remarks,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?)""",
-                no, v["reporter"], v["contact"], v["dept"], v["location"], v["item_name"],
-                v["category"], v["severity"], v["description"], photo_data, "Received", now_s())
-            row = q1("SELECT * FROM damage_reports WHERE report_no=?", no)
-            return render_template("report_success.html", r=_decorate(row))
-        flash("Please correct the highlighted fields below.", "err")
-    return render_template("report_form.html", v=v, e=e, severities=SEVERITIES)
+                db().executescript(RP_SCHEMA)
+        except Exception as err:
+            if USE_PG:
+                try: db().c.rollback()
+                except Exception: pass
+            print("rp_init note (another worker may have done this already):", err)
 
-@app.route("/report/track", methods=["GET", "POST"])
-def report_track():
-    v = {"report_no": "", "contact": ""}
-    r = None; tl = []; posted = False
+ICONS.update({
+ "alert": '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+ "search": '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+})
+
+# ---- small helpers -------------------------------------------------------------------------------------------------
+RP_HITS = {}
+def rp_ip():
+    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "?")
+
+def rp_limited(bucket, limit, window=600):
+    """Soft anti-spam limit per visitor address (the form has no login)."""
+    if len(RP_HITS) > 5000: RP_HITS.clear()
+    key, now = (bucket, rp_ip()), time.time()
+    hits = [t for t in RP_HITS.get(key, []) if now - t < window]
+    if len(hits) >= limit:
+        RP_HITS[key] = hits; return True
+    hits.append(now); RP_HITS[key] = hits; return False
+
+def rp_photo(file):
+    """-> (base64 text, mime type, error). Only real JPG / PNG / WebP files are accepted (checked by file signature)."""
+    if not file or not file.filename: return None, None, None
+    raw = file.read(RP_MAX_PHOTO + 1)
+    if not raw: return None, None, None
+    if len(raw) > RP_MAX_PHOTO: return None, None, "The photo is too large (maximum 4 MB). Choose a smaller photo."
+    if raw[:3] == b"\xff\xd8\xff": mt = "image/jpeg"
+    elif raw[:8] == b"\x89PNG\r\n\x1a\n": mt = "image/png"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP": mt = "image/webp"
+    else: return None, None, "The photo must be a JPG, PNG or WebP image."
+    return base64.b64encode(raw).decode(), mt, None
+
+def rp_find(code):
+    code = (code or "").strip().upper()
+    ticket, _, tok = code.rpartition("-")
+    if code.count("-") < 3 or not tok: return None
+    return q1("SELECT %s FROM damage_reports WHERE ticket=? AND token=?" % RP_COLS, ticket, tok)
+
+def rp_code(r): return "%s-%s" % (r["ticket"], r["token"])
+def rp_counts(): return {k: q1("SELECT COUNT(*) FROM damage_reports WHERE " + w)[0] for k, w in RP_WHERE.items()}
+
+_RP_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+def rp_mail(to, subject, body):
+    """Optional e-mail (only when SMTP_HOST is set). Runs in the background and never breaks the page if it fails."""
+    host = os.environ.get("SMTP_HOST", "").strip()
+    to = [t for t in to if t and _RP_EMAIL.match(t)]
+    if not host or not to: return
+    def run():
+        try:
+            m = EmailMessage(); m["Subject"] = re.sub(r"\s+", " ", subject)[:200]; m["To"] = ", ".join(to)
+            m["From"] = os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or "gso@localhost"; m.set_content(body)
+            port = int(os.environ.get("SMTP_PORT", "587"))
+            s = smtplib.SMTP_SSL(host, port, timeout=15) if port == 465 else smtplib.SMTP(host, port, timeout=15)
+            with s:
+                if port != 465: s.starttls()
+                if os.environ.get("SMTP_USER"): s.login(os.environ["SMTP_USER"], os.environ.get("SMTP_PASS", ""))
+                s.send_message(m)
+        except Exception as err:
+            print("rp_mail failed:", err)
+    threading.Thread(target=run, daemon=True).start()
+
+def rp_link(path): return (os.environ.get("APP_URL", "").rstrip("/") + path) if os.environ.get("APP_URL") else ""
+
+def rp_csv(x):
+    x = "" if x is None else str(x)
+    return "'" + x if len(x) > 1 and x[:1] in ("=", "+", "-", "@") else x      # stops spreadsheet formula injection from public input
+
+# ---- public: report form -------------------------------------------------------------------------------------------
+@app.route("/report", methods=["GET", "POST"])
+def rp_form():
+    v, e = {"problem": RP_PROBLEMS[0]}, {}
     if request.method == "POST":
-        posted = True
-        v["report_no"] = (request.form.get("report_no") or "").strip().upper()
-        v["contact"]   = (request.form.get("contact") or "").strip()
-        row = q1("SELECT * FROM damage_reports WHERE report_no=? AND contact=?", v["report_no"], v["contact"])
-        if row:
-            r = _decorate(row)
-            tl = q("SELECT * FROM report_timeline WHERE report_id=? ORDER BY id", row["id"])
-    return render_template("track.html", v=v, r=r, tl=tl, posted=posted)
+        v = {k: request.form.get(k, "").strip() for k in ("reporter", "contact", "dept", "item", "location", "problem", "description", "urgent", "website")}
+        if v["website"]: return redirect(url_for("home"))                       # hidden field: only bots fill it in
+        for k, label in (("reporter", "Your name"), ("contact", "Contact number or e-mail"), ("item", "Equipment / item"),
+                         ("location", "Location (building / room)"), ("description", "Description of the problem")):
+            if not v[k]: bad(e, k, label + " is required.")
+        if v["description"] and len(v["description"]) < 10: bad(e, "description", "Please describe the problem in a few more words.")
+        if v["problem"] not in RP_PROBLEMS: v["problem"] = RP_PROBLEMS[0]
+        photo, ptype, perr = rp_photo(request.files.get("photo"))
+        if perr: bad(e, "photo", perr)
+        if e: bad(e, "form", "Please fix the highlighted items. If you attached a photo, please attach it again.")
+        elif rp_limited("submit", 15): bad(e, "form", "Too many reports were sent from this network in a short time. Please wait a few minutes and try again.")
+        else:
+            tok = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6)); n = now_s()
+            ex("""INSERT INTO damage_reports(token,reporter,contact,dept,item,location,problem,urgent,description,photo,photo_type,status,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,'New',?,?)""", tok, v["reporter"][:120], v["contact"][:120], v["dept"][:120], v["item"][:80],
+               v["location"][:120], v["problem"], 1 if v["urgent"] else 0, v["description"][:1500], photo, ptype, n, n)
+            rid = q1("SELECT id FROM damage_reports WHERE token=?", tok)["id"]
+            ex("UPDATE damage_reports SET ticket=? WHERE id=?", "DR-%d-%04d" % (today_ph().year, rid), rid)
+            ex("INSERT INTO damage_updates(report_id,status,note,public,by_name,created_at) VALUES(?,?,?,?,?,?)", rid, "New", "Report received by the GSO system.", 1, "System", n)
+            rep = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+            rp_mail([x.strip() for x in os.environ.get("GSO_NOTIFY_EMAIL", "").split(",")],
+                    "%sNew damage report %s - %s" % ("[URGENT] " if rep["urgent"] else "", rep["ticket"], rep["item"]),
+                    "A new damage report was submitted.\n\nTicket: %s\nItem: %s\nLocation: %s\nProblem: %s\nUrgent: %s\nReported by: %s (%s)\n\n%s\n\n%s"
+                    % (rep["ticket"], rep["item"], rep["location"], rep["problem"], "YES" if rep["urgent"] else "no", rep["reporter"], rep["contact"],
+                       rep["description"], rp_link("/gso/report/%d" % rid)))
+            return redirect(url_for("rp_done", c=rp_code(rep)))
+    items = sorted({r["name"] for r in q("SELECT name FROM inventory")} | set(RP_COMMON), key=str.lower)
+    return render_template("rp_form.html", v=v, e=e, items=items, problems=RP_PROBLEMS, page_sub="General Services Office - Report Broken Equipment")
+
+@app.route("/report/done")
+def rp_done():
+    rep = rp_find(request.args.get("c", ""))
+    if not rep: return redirect(url_for("rp_form"))
+    return render_template("rp_done.html", rep=rep, code=rp_code(rep), page_sub="General Services Office - Report Broken Equipment")
+
+@app.route("/report/track")
+def rp_track():
+    code, rep, ups, err = request.args.get("code", "").strip(), None, [], ""
+    if code:
+        if rp_limited("track", 30): err = "Too many attempts. Please wait a few minutes and try again."
+        else:
+            rep = rp_find(code)
+            if not rep: err = "No report found with that tracking code. Please check the code and try again."
+            else: ups = q("SELECT * FROM damage_updates WHERE report_id=? AND public=1 ORDER BY id DESC", rep["id"])
+    return render_template("rp_track.html", code=code, rep=rep, ups=ups, err=err, page_sub="General Services Office - Report Broken Equipment")
+
+# ---- GSO admin: separate Damage Reports dashboard ------------------------------------------------------------------
+def rp_summary():
+    ds = []
+    for r in q("SELECT created_at, resolved_at FROM damage_reports WHERE status='Resolved' AND resolved_at IS NOT NULL"):
+        try: ds.append((datetime.strptime(r["resolved_at"], "%Y-%m-%d %H:%M") - datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M")).total_seconds() / 86400)
+        except Exception: pass
+    top = lambda col: [(r[1], r[2]) for r in q("SELECT LOWER(%s) k, MIN(%s) n, COUNT(*) c FROM damage_reports WHERE status!='Rejected' GROUP BY LOWER(%s) ORDER BY c DESC LIMIT 8" % (col, col, col))]
+    return dict(urgent_open=q1("SELECT COUNT(*) FROM damage_reports WHERE urgent=1 AND status IN ('New','In Progress')")[0],
+                avg_days=round(sum(ds) / len(ds), 1) if ds else None, top_items=top("item"), top_locs=top("location"),
+                months=[(r[0], r[1]) for r in q("SELECT SUBSTR(created_at,1,7) m, COUNT(*) c FROM damage_reports GROUP BY SUBSTR(created_at,1,7) ORDER BY m DESC LIMIT 6")])
 
 @app.route("/gso")
-@gso_admin
-def gso_dashboard():
-    tab = request.args.get("tab", "open")
-    where_map = {
-        "open":     "status IN ('Received','In Progress')",
-        "received": "status='Received'",
-        "progress": "status='In Progress'",
-        "resolved": "status='Resolved'",
-        "urgent":   "severity='Urgent / Mapanganib' AND status!='Resolved'",
-        "all":      "1=1",
-    }
-    where = where_map.get(tab, where_map["open"])
-    rows = [_decorate(r) for r in q("SELECT * FROM damage_reports WHERE %s ORDER BY id DESC" % where)]
-    cnt = {
-        "Received":     q1("SELECT COUNT(*) FROM damage_reports WHERE status='Received'")[0],
-        "In Progress":  q1("SELECT COUNT(*) FROM damage_reports WHERE status='In Progress'")[0],
-        "Resolved":     q1("SELECT COUNT(*) FROM damage_reports WHERE status='Resolved'")[0],
-        "Urgent":       q1("SELECT COUNT(*) FROM damage_reports WHERE severity='Urgent / Mapanganib' AND status!='Resolved'")[0],
-    }
-    tabs = [
-        {"k":"open",     "label":"Open (new + in progress)", "n": cnt["Received"]+cnt["In Progress"]},
-        {"k":"received", "label":"New / Received", "n": cnt["Received"]},
-        {"k":"progress", "label":"In Progress",     "n": cnt["In Progress"]},
-        {"k":"resolved", "label":"Resolved",        "n": cnt["Resolved"]},
-        {"k":"urgent",   "label":"Urgent",          "n": cnt["Urgent"]},
-        {"k":"all",      "label":"All",           "n": None},
-    ]
-    return render_template("gso_dash.html", rows=rows, cnt=cnt, tab=tab, tabs=tabs)
+@admin_required
+def gso_dash():
+    tab = request.args.get("tab", "new")
+    if tab != "summary" and tab not in RP_WHERE: tab = "new"
+    ctx = dict(tab=tab, cnt=rp_counts(), title=RP_TITLES[tab], qs="", page_sub="General Services Office - Damage Reports")
+    if tab == "summary": ctx.update(rp_summary())
+    else:
+        qs = request.args.get("qs", "").strip()[:60]; sql = "SELECT %s FROM damage_reports WHERE %s" % (RP_COLS, RP_WHERE[tab]); args = []
+        if qs:
+            sql += " AND (LOWER(ticket) LIKE ? OR LOWER(item) LIKE ? OR LOWER(location) LIKE ? OR LOWER(reporter) LIKE ? OR LOWER(description) LIKE ?)"
+            args = ["%" + qs.lower() + "%"] * 5
+        sql += " ORDER BY urgent DESC, id DESC" if tab in ("new", "progress") else " ORDER BY id DESC"
+        ctx.update(rows=q(sql, *args), qs=qs)
+    return render_template("gso_dash.html", **ctx)
 
 @app.route("/gso/report/<int:rid>")
-@gso_admin
-def gso_detail(rid):
-    row = q1("SELECT * FROM damage_reports WHERE id=?", rid)
-    if not row: abort(404)
-    tl = q("SELECT * FROM report_timeline WHERE report_id=? ORDER BY id", rid)
-    return render_template("gso_detail.html", r=_decorate(row), tl=tl, statuses=STATUSES)
+@admin_required
+def gso_view(rid):
+    r = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+    if not r: abort(404)
+    return render_template("gso_view.html", r=r, ups=q("SELECT * FROM damage_updates WHERE report_id=? ORDER BY id DESC", rid), statuses=RP_STATUSES,
+                           cnt=rp_counts(), tab="", page_sub="General Services Office - Damage Reports")
 
 @app.route("/gso/report/<int:rid>/update", methods=["POST"])
-@gso_admin
+@admin_required
 def gso_update(rid):
-    row = q1("SELECT * FROM damage_reports WHERE id=?", rid)
-    if not row: abort(404)
-    status = (request.form.get("status") or "").strip()
-    if status not in STATUSES:
-        flash("Invalid status.", "err"); return redirect(url_for("gso_detail", rid=rid))
-    remarks = (request.form.get("remarks") or "").strip()
-    resolved_at = now_s() if status == "Resolved" else (row["resolved_at"] if status != "Resolved" else now_s())
-    if status != "Resolved": resolved_at = row["resolved_at"]  # keep existing
-    ex("UPDATE damage_reports SET status=?, admin_remarks=?, updated_at=?, resolved_at=? WHERE id=?",
-       status, remarks, now_s(), resolved_at, rid)
-    ex("INSERT INTO report_timeline(report_id,status,remarks,by_user,created_at) VALUES(?,?,?,?,?)",
-       rid, status, remarks, (g.user["fullname"] if g.user else "admin"), now_s())
-    flash("Report %s updated: %s" % (row["report_no"], status), "ok")
-    return redirect(url_for("gso_detail", rid=rid))
+    r = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+    if not r: abort(404)
+    st, note = request.form.get("status", r["status"]), request.form.get("note", "").strip()[:600]
+    public = 1 if request.form.get("public") else 0
+    if st not in RP_STATUSES: abort(400)
+    if st == r["status"] and not note: flash("Nothing to update. Change the status or write a note.", "err"); return redirect(url_for("gso_view", rid=rid))
+    if st == "Rejected" and not note: flash("Please write a reason in the note when rejecting a report.", "err"); return redirect(url_for("gso_view", rid=rid))
+    n = now_s(); done = (r["resolved_at"] if r["status"] == "Resolved" and r["resolved_at"] else n) if st == "Resolved" else None
+    ex("UPDATE damage_reports SET status=?, updated_at=?, resolved_at=? WHERE id=?", st, n, done, rid)
+    ex("INSERT INTO damage_updates(report_id,status,note,public,by_name,created_at) VALUES(?,?,?,?,?,?)", rid, st, note, public, g.user["fullname"], n)
+    if public:
+        rp_mail([r["contact"]], "Update on your damage report %s" % r["ticket"],
+                "Hello %s,\n\nYour report %s (%s) is now: %s\n%s\n\nTrack it any time with this code: %s\n%s\n\n- General Services Office"
+                % (r["reporter"], r["ticket"], r["item"], st, ("Note from GSO: " + note) if note else "", rp_code(r), rp_link("/report/track?code=" + rp_code(r))))
+    flash("Report %s updated." % r["ticket"], "ok")
+    return redirect(url_for("gso_view", rid=rid))
+
+@app.route("/gso/report/<int:rid>/delete", methods=["POST"])
+@admin_required
+def gso_delete(rid):
+    r = q1("SELECT ticket FROM damage_reports WHERE id=?", rid)
+    if not r: abort(404)
+    ex("DELETE FROM damage_updates WHERE report_id=?", rid); ex("DELETE FROM damage_reports WHERE id=?", rid)
+    flash("Report %s was deleted." % r["ticket"], "ok")
+    return redirect(url_for("gso_dash", tab="all"))
+
+@app.route("/gso/photo/<int:rid>")
+@admin_required
+def gso_photo(rid):
+    r = q1("SELECT photo, photo_type FROM damage_reports WHERE id=?", rid)
+    if not r or not r["photo"] or r["photo_type"] not in ("image/jpeg", "image/png", "image/webp"): abort(404)
+    return Response(base64.b64decode(r["photo"]), mimetype=r["photo_type"], headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"})
+
+@app.route("/gso/api/count")
+@admin_required
+def gso_count():
+    return jsonify(new=q1("SELECT COUNT(*) FROM damage_reports WHERE status='New'")[0])
 
 @app.route("/gso/export.csv")
-@gso_admin
-def gso_export_csv():
-    rows = q("SELECT * FROM damage_reports ORDER BY id DESC")
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["Report No.","Date Filed","Reporter","Contact","Dept","Location","Item","Category",
-                "Severity","Description","Status","Admin Remarks","Created At","Updated At","Resolved At"])
-    for r in rows:
-        w.writerow([r["report_no"], r["created_at"], r["reporter"], r["contact"], r["dept"] or "",
-                    r["location"], r["item_name"], r["category"], r["severity"], r["description"],
-                    r["status"], r["admin_remarks"] or "", r["created_at"], r["updated_at"] or "", r["resolved_at"] or ""])
-    return Response(buf.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=gso_damage_reports.csv"})
+@admin_required
+def gso_export():
+    out = io.StringIO(); w = csv.writer(out)
+    w.writerow(["Ticket", "Date filed", "Status", "Urgent", "Item", "Problem", "Location", "Description", "Reporter", "Contact", "College/Office", "Resolved on"])
+    for r in q("SELECT %s FROM damage_reports ORDER BY id" % RP_COLS):
+        w.writerow([rp_csv(x) for x in (r["ticket"], r["created_at"], r["status"], "Yes" if r["urgent"] else "", r["item"], r["problem"], r["location"],
+                                        r["description"], r["reporter"], r["contact"], r["dept"], r["resolved_at"])])
+    return Response("﻿" + out.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=damage-reports.csv"})
 
-# ---------------------------------------------------------------------------
-# 9. RUN (same entry point style as the original)
-# ---------------------------------------------------------------------------
+# Compress pages (HTML/CSV/JSON) to make them lighter on phones. Registered BEFORE the other after_request helpers so it runs LAST.
+import gzip
+@app.after_request
+def rp_gzip(resp):
+    try:
+        if (resp.status_code == 200 and not resp.direct_passthrough and "gzip" in request.headers.get("Accept-Encoding", "")
+                and "Content-Encoding" not in resp.headers and resp.mimetype in ("text/html", "text/css", "text/csv", "application/json")):
+            data = resp.get_data()
+            if len(data) > 1024:
+                resp.set_data(gzip.compress(data, 6)); resp.headers["Content-Encoding"] = "gzip"; resp.headers.add("Vary", "Accept-Encoding")
+    except Exception:
+        pass
+    return resp
 
+# Small "Report broken equipment" button, top-right under the header, on the sign-in page only (login page code is not edited).
+@app.after_request
+def rp_login_button(resp):
+    try:
+        if request.endpoint == "login" and resp.status_code == 200 and resp.mimetype == "text/html":
+            btn = ('<div style="text-align:right;padding:10px clamp(8px,2vw,22px) 0"><a href="%s" style="display:inline-block;background:#b45309;color:#fff;'
+                   'padding:6px 14px;border-radius:18px;font:600 13px system-ui,sans-serif;text-decoration:none;box-shadow:0 3px 10px rgba(0,0,0,.25)">'
+                   '&#9888; Report broken equipment</a></div>' % url_for("rp_form"))
+            resp.set_data(resp.get_data(as_text=True).replace("</header>", "</header>" + btn, 1))
+    except Exception:
+        pass
+    return resp
+
+# Small "Damage Reports" shortcut shown ONLY to the admin on the facility dashboard (so new reports are noticed). The old page code is not edited.
+@app.after_request
+def rp_switch_pill(resp):
+    try:
+        if request.endpoint == "dashboard" and g.get("user") and g.user["role"] == "admin" and resp.status_code == 200 and resp.mimetype == "text/html":
+            n = q1("SELECT COUNT(*) FROM damage_reports WHERE status='New'")[0]
+            pill = ('<a href="%s" style="position:fixed;right:14px;bottom:18px;z-index:30;background:#b45309;color:#fff;padding:10px 16px;border-radius:24px;'
+                    'font:600 14px system-ui,sans-serif;text-decoration:none;box-shadow:0 6px 18px rgba(0,0,0,.3)">Damage Reports%s &rarr;</a>'
+                    % (url_for("gso_dash"), (' <span style="background:#fff;color:#b45309;border-radius:10px;padding:1px 8px;margin-left:4px">%d new</span>' % n) if n else ""))
+            resp.set_data(resp.get_data(as_text=True).replace("</body>", pill + "</body>", 1))
+    except Exception:
+        pass
+    return resp
+
+# ---- templates + styling for the new pages --------------------------------------------------------------------------
+_b = T["base.html"]          # lets the new pages set their own browser-tab title / header subtitle / background; old pages render exactly as before
+_b = _b.replace("<title>Facility &amp; Equipment Request - SLSU</title>", "<title>{{ page_title|default('Facility &amp; Equipment Request - SLSU')|safe }}</title>")
+_b = _b.replace("<small>General Services Office - Facility &amp; Equipment Request</small>", "<small>{{ page_sub|default('General Services Office - Facility &amp; Equipment Request')|safe }}</small>")
+_b = _b.replace("'authbg' if request.endpoint in ('login',", "'authbg' if request.endpoint in ('rp_form', 'rp_done', 'rp_track', 'login',")
+_b = _b.replace("'dash' if request.endpoint in (", "'dash' if (request.endpoint or '').startswith(('gso_', 'sched_')) or request.endpoint in (")
+# Fixed background that never moves while scrolling (the old "background-attachment: fixed" is ignored by many phones/browsers,
+# so the picture is drawn on a fixed layer behind the page instead). Applies to the login pages and all dashboards.
+_b = _b.replace("</style></head>", """body.authbg,body.dash{background:var(--bg)!important}
+body.authbg::before,body.dash::before{content:"";position:fixed;top:0;left:0;width:100%;height:100%;z-index:-1;pointer-events:none;background:linear-gradient(rgba(255,255,255,.10),rgba(255,255,255,.10)),url('/bg.jpg') center/cover no-repeat}
+body.dash::before{background:linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url('/bg.jpg') center/cover no-repeat}
+</style></head>""", 1)
+T["base.html"] = _b
+
+RP_CSS = """
+.rp-choices{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}@media(max-width:700px){.rp-choices{grid-template-columns:1fr}}
+.rp-choice{display:flex;flex-direction:column;gap:10px;padding:28px 24px;text-decoration:none;color:var(--tx);border-radius:16px;background:rgba(255,255,255,.95);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.08);transition:transform .2s ease,box-shadow .2s ease}
+.rp-choice:hover{transform:translateY(-4px);box-shadow:0 14px 30px rgba(20,83,45,.22);opacity:1}
+.rp-ic{width:54px;height:54px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#2d6a4f,#14532d);color:#fff}.rp-ic.warn{background:linear-gradient(135deg,#e0a526,#b45309)}
+.rp-ic svg{width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.rp-choice b{font:600 20px Georgia,serif;color:var(--pr)}.rp-choice .d{color:var(--mu);font-size:14px}.rp-go{margin-top:auto;font-weight:700;color:var(--pr);padding-top:6px}
+.rp-narrow{max-width:640px;margin-left:auto;margin-right:auto}
+textarea{width:100%;padding:9px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit;min-height:96px;resize:vertical}
+.auth textarea{padding:12px 13px;font-size:16px}textarea:focus{outline:none;border-color:var(--pr);box-shadow:0 0 0 3px rgba(20,65,123,.22)}
+.rp-urg{background:#a63232;color:#fff;border-radius:12px;padding:1px 8px;font-size:11px;font-weight:700;margin-left:4px;white-space:nowrap}
+.b.New{background:#fde8c8;color:#8a4b00}.b.InProgress{background:#dbe7fb;color:#14417b}.b.Resolved{background:#d5f0de;color:#1e6b3a}.b.Rejected{background:#e6e8ec;color:#4a5160}
+.rp-code{font:700 26px/1.2 ui-monospace,Consolas,monospace;letter-spacing:1px;background:#eef6f0;border:2px dashed #2d6a4f;border-radius:10px;padding:14px;text-align:center;margin:14px 0;word-break:break-all;user-select:all}
+.rp-dl{display:grid;grid-template-columns:130px 1fr;gap:8px 14px;margin:0}.rp-dl dt{color:var(--mu);font-size:13px}.rp-dl dd{margin:0;word-break:break-word}
+@media(max-width:560px){.rp-dl{grid-template-columns:1fr;gap:1px}.rp-dl dt{margin-top:8px}}
+.rp-2{display:grid;grid-template-columns:1.2fr 1fr;gap:18px;align-items:start}@media(max-width:820px){.rp-2{grid-template-columns:1fr}}
+.rp-tl{list-style:none;margin:0;padding:0}.rp-tl li{border-left:3px solid #95d5b2;padding:2px 0 12px 12px;margin-left:4px}.rp-tl small{color:var(--mu);display:block}
+.rp-photo{max-width:100%;max-height:340px;border-radius:8px;border:1px solid var(--bd);display:block;margin-top:6px}
+.rp-bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}.rp-bar input{flex:1;min-width:180px;width:auto}.rp-bar button,.rp-bar .btn{margin:0}
+"""
+app.jinja_env.globals["RPCSS"] = RP_CSS
+
+T["rp_base.html"] = """{% extends 'base.html' %}{% block body %}<style>{{ RPCSS|safe }}</style>{% block rp %}{% endblock %}{% endblock %}"""
+
+T["rp_macros.html"] = """
+{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{{ ICONS[n]|safe }}</svg>{% endmacro %}
+{% macro gside(tab, cnt) %}<button type="button" class="menubtn" onclick="menu(true)" aria-label="Open menu">{{ ico('menu') }}</button><div id="sideBg" class="sideBg" onclick="menu(false)"></div>
+<nav id="side" class="side"><div class="sideuser"><div class="av">{{ (g.user.fullname or '?')[:1]|upper }}</div><div class="who2"><b>{{ g.user.fullname }}</b><span>Damage Reports</span></div><button type="button" class="x" onclick="menu(false)" aria-label="Close menu">{{ ico('x') }}</button></div>
+<div class="navlabel" style="--i:1">Damage reports</div>
+{% for k, label, n, ic in [('new','New',cnt['new'],'bell'),('progress','In Progress',cnt['progress'],'pending'),('resolved','Resolved',cnt['resolved'],'approved'),('rejected','Rejected',cnt['rejected'],'disapproved'),('all','All reports',cnt['all'],'list'),('summary','Summary',none,'report'),('backup','Backup &amp; export',none,'stock')] %}
+<a class="nav {{ 'on' if tab == k }}" style="--i:{{ loop.index + 1 }}" href="{{ url_for('gso_backup') if k == 'backup' else url_for('gso_dash', tab=k) }}">{{ ico(ic) }}<span>{{ label }}</span>{% if n is not none %}<span class="cnt" {% if k == 'new' %}id="gsoNew"{% endif %}>{{ n }}</span>{% endif %}</a>{% endfor %}
+<div class="navlabel" style="--i:8">Other system</div>
+<a class="nav" style="--i:9" href="{{ url_for('dashboard') }}">{{ ico('stock') }}<span>Facility &amp; Equipment</span></a>
+<div class="foot"><a class="nav" href="{{ url_for('account') }}">{{ ico('lock') }}<span>Change password</span></a><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="signout">{{ ico('out') }}<span>Sign out</span></button></form></div></nav>
+<script>(function(){var last={{ cnt['new'] }};setInterval(function(){fetch('/gso/api/count',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){
+ var el=document.getElementById('gsoNew');if(el)el.textContent=d['new'];
+ if(d['new']>last&&!document.getElementById('gsoAlert')){var a=document.createElement('div');a.id='gsoAlert';a.className='msg ok';a.innerHTML='A new damage report was received. <a href="/gso?tab=new">View new reports</a>';var w=document.querySelector('.wrap');w.insertBefore(a,w.firstChild)}
+ last=d['new']}).catch(function(){})},45000)})()</script>{% endmacro %}
+{% macro badge(s) %}<span class="b {{ s|replace(' ', '') }}">{{ s }}</span>{% endmacro %}
+"""
+
+T["rp_form.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'macros.html' as m %}
+<form class="card auth rp-narrow" method="post" enctype="multipart/form-data" onsubmit="var b=this.querySelector('button.sub');setTimeout(function(){b.disabled=true},0)">{{ m.token() }}
+<h2 style="font-size:22px">Report Broken / Damaged Equipment</h2>
+<p class="mu" style="font-size:14px">No account needed. Fields marked * are required. The GSO will receive your report right away.</p>
+{% if e.get('form') %}<div class="msg err">{{ e['form'][0] }}</div>{% endif %}
+<div style="position:absolute;left:-9999px" aria-hidden="true"><label>Website<input name="website" tabindex="-1" autocomplete="off"></label></div>
+<label>Equipment / item *</label><input name="item" list="rp-items" maxlength="80" value="{{ v.get('item','') }}" placeholder="e.g. Projector, Chair, Aircon" required><datalist id="rp-items">{% for i in items %}<option value="{{ i }}">{% endfor %}</datalist>{{ m.fe(e,'item') }}
+<label>Location (building / room) *</label><input name="location" maxlength="120" value="{{ v.get('location','') }}" placeholder="e.g. Admin Building, Room 203" required>{{ m.fe(e,'location') }}
+<label>What is wrong? *</label><select name="problem">{% for p in problems %}<option {{ 'selected' if v.get('problem') == p }}>{{ p }}</option>{% endfor %}</select>
+<label>Describe the problem *</label><textarea name="description" maxlength="1500" placeholder="What happened? Since when? Is it still usable?" required>{{ v.get('description','') }}</textarea>{{ m.fe(e,'description') }}
+<div class="ck" style="margin-top:10px"><label><input type="checkbox" name="urgent" value="1" {{ 'checked' if v.get('urgent') }}> This is urgent / a safety hazard (exposed wires, leaking, could hurt someone)</label></div>
+<label>Photo (optional)</label><input type="file" name="photo" id="rpPhoto" accept="image/*">{{ m.fe(e,'photo') }}<img id="rpPrev" class="rp-photo" alt="" style="display:none">
+<label>Your name *</label><input name="reporter" maxlength="120" value="{{ v.get('reporter','') }}" required>{{ m.fe(e,'reporter') }}
+<label>Contact number or e-mail *</label><input name="contact" maxlength="120" value="{{ v.get('contact','') }}" placeholder="So the GSO can reach you" required>{{ m.fe(e,'contact') }}
+<label>College / Office (optional)</label><input name="dept" maxlength="120" value="{{ v.get('dept','') }}">
+<button class="sub">Submit report</button><a class="btn s" href="{{ url_for('home') }}">Cancel</a></form>
+<script>(function(){var f=document.getElementById('rpPhoto'),pv=document.getElementById('rpPrev');if(!f)return;
+f.addEventListener('change',function(){var file=f.files[0];pv.style.display='none';if(!file||!/^image\\/(jpeg|png|webp)$/.test(file.type))return;
+ var u=URL.createObjectURL(file),img=new Image();img.onload=function(){pv.src=u;pv.style.display='block';
+  if(!window.DataTransfer)return;var s=Math.min(1,1280/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=Math.round(img.width*s);c.height=Math.round(img.height*s);
+  c.getContext('2d').drawImage(img,0,0,c.width,c.height);c.toBlob(function(b){if(!b)return;try{var dt=new DataTransfer();dt.items.add(new File([b],'photo.jpg',{type:'image/jpeg'}));f.files=dt.files}catch(x){}},'image/jpeg',.82)};img.src=u})})()</script>{% endblock %}"""
+
+T["rp_done.html"] = """{% extends 'rp_base.html' %}{% block rp %}
+<div class="card rp-narrow" style="text-align:center"><h2 style="font-size:24px">Report submitted &#10003;</h2>
+<p>Thank you! The General Services Office has received your report for <b>{{ rep.item }}</b>.</p>
+<p class="mu" style="font-size:14px;margin-bottom:0">Save this tracking code. You can use it to check the status of your report:</p><div class="rp-code">{{ code }}</div>
+<a class="btn" href="{{ url_for('rp_track', code=code) }}">Check status</a><a class="btn s" href="{{ url_for('rp_form') }}">Report another</a><a class="btn s" href="{{ url_for('home') }}">Back to sign in</a></div>{% endblock %}"""
+
+T["rp_track.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}
+<div class="card rp-narrow"><h2>Check my report</h2><form method="get" class="rp-bar"><input name="code" value="{{ code }}" placeholder="Tracking code, e.g. DR-2026-0007-K4X9Q2" required><button>Check</button></form>
+{% if err %}<div class="msg err" style="margin:0">{{ err }}</div>{% endif %}
+{% if rep %}<hr style="border:0;border-top:1px solid var(--bd);margin:14px 0"><p style="margin:0 0 6px"><b>{{ rep.ticket }}</b> &middot; {{ rm.badge(rep.status) }}{% if rep.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</p>
+<dl class="rp-dl"><dt>Item</dt><dd>{{ rep.item }}</dd><dt>Location</dt><dd>{{ rep.location }}</dd><dt>Problem</dt><dd>{{ rep.problem }}</dd><dt>Date filed</dt><dd>{{ rep.created_at|dt12 }}</dd><dt>Last update</dt><dd>{{ rep.updated_at|dt12 }}</dd></dl>
+<h4 style="margin:18px 0 8px">Progress</h4><ul class="rp-tl">{% for u in ups %}<li>{{ rm.badge(u.status) }} {% if u.note %}{{ u.note }}{% endif %}<small>{{ u.created_at|dt12 }}</small></li>{% endfor %}</ul>{% endif %}
+<a class="btn s" href="{{ url_for('home') }}">Back to sign in</a></div>{% endblock %}"""
+
+T["gso_dash.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{{ rm.gside(tab, cnt) }}
+{% if tab == 'summary' %}<div class="card"><h2>Damage Reports - Summary</h2>
+<div class="stats"><div class="stat"><b>{{ cnt['all'] }}</b><span>Total reports</span></div><div class="stat"><b>{{ cnt['new'] }}</b><span>New</span></div><div class="stat"><b>{{ cnt['progress'] }}</b><span>In progress</span></div><div class="stat"><b>{{ cnt['resolved'] }}</b><span>Resolved</span></div><div class="stat"><b>{{ urgent_open }}</b><span>Urgent &amp; still open</span></div><div class="stat"><b>{{ avg_days if avg_days is not none else '-' }}</b><span>Avg. days to resolve</span></div></div>
+<div class="rp-2"><div><h4>Most reported items</h4><table>{% for n, c in top_items %}<tr><td>{{ n }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div>
+<div><h4>Locations with most reports</h4><table>{% for n, c in top_locs %}<tr><td>{{ n }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div></div>
+<h4>Reports per month (last 6)</h4><table>{% for mo, c in months %}<tr><td>{{ mo }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table>
+<a class="btn" href="{{ url_for('gso_export') }}">Download CSV (Excel)</a></div>
+{% else %}<div class="card"><h2>{{ title }}</h2>
+{% if tab == 'new' %}<p class="mu">New reports from the public form appear here (urgent ones first). Open a report to acknowledge it, update its status and leave a note for the reporter.</p>{% endif %}
+<form method="get" class="rp-bar"><input type="hidden" name="tab" value="{{ tab }}"><input name="qs" value="{{ qs }}" placeholder="Search ticket, item, location, reporter"><button>Search</button>{% if qs %}<a class="btn s" href="{{ url_for('gso_dash', tab=tab) }}">Clear</a>{% endif %}</form>
+<div class="tb"><table><tr><th>Ticket</th><th>Item / problem</th><th>Location</th><th>Reported by</th><th>Filed</th><th>Status</th><th></th></tr>
+{% for x in rows %}<tr><td><a href="{{ url_for('gso_view', rid=x.id) }}">{{ x.ticket }}</a>{% if x.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</td><td><b>{{ x.item }}</b><br><span class="mu">{{ x.problem }}</span></td><td>{{ x.location }}</td><td>{{ x.reporter }}<br><span class="mu">{{ x.contact }}</span></td><td>{{ x.created_at|dt12 }}</td><td>{{ rm.badge(x.status) }}</td><td><a class="btn sm" href="{{ url_for('gso_view', rid=x.id) }}">Open</a></td></tr>
+{% else %}<tr><td colspan="7">No reports here.</td></tr>{% endfor %}</table></div></div>{% endif %}{% endblock %}"""
+
+T["gso_backup.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{{ rm.gside(tab, cnt) }}
+<div class="card"><h2>Backup &amp; Export</h2><p class="mu" style="font-size:14px">Download a copy of all the system's data (requests, equipment stock, users without passwords, notifications and damage reports with photos). Keep the file private - it contains names, student numbers and contact details.</p>
+<a class="btn" href="{{ url_for('gso_backup_zip') }}">Download full backup (.zip)</a>
+<div class="tb" style="margin-top:14px"><table><tr><th>Data</th><th>Records</th><th></th></tr>{% for n, label, c in info %}<tr><td>{{ label }}</td><td>{{ c }}</td><td><a class="btn s sm" href="{{ url_for('gso_backup_csv', name=n) }}">Download CSV</a></td></tr>{% endfor %}</table></div></div>{% endblock %}"""
+
+T["gso_view.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{% import 'macros.html' as m %}{{ rm.gside(tab, cnt) }}
+<p><a href="{{ url_for('gso_dash', tab='new') }}">&lsaquo; Back to reports</a></p>
+<div class="rp-2"><div class="card"><h2>{{ r.ticket }} {% if r.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</h2><p style="margin:-6px 0 12px">{{ rm.badge(r.status) }}</p>
+<dl class="rp-dl"><dt>Item</dt><dd><b>{{ r.item }}</b></dd><dt>Problem type</dt><dd>{{ r.problem }}</dd><dt>Location</dt><dd>{{ r.location }}</dd><dt>Description</dt><dd style="white-space:pre-wrap">{{ r.description }}</dd>
+<dt>Reported by</dt><dd>{{ r.reporter }}</dd><dt>Contact</dt><dd>{{ r.contact }}</dd><dt>College / Office</dt><dd>{{ r.dept or '-' }}</dd><dt>Date filed</dt><dd>{{ r.created_at|dt12 }}</dd>{% if r.resolved_at %}<dt>Resolved on</dt><dd>{{ r.resolved_at|dt12 }}</dd>{% endif %}
+<dt>Tracking code</dt><dd style="font-family:monospace">{{ r.ticket }}-{{ r.token }}</dd></dl>
+<p style="margin:14px 0 0"><a class="btn" href="{{ url_for('gso_pdf', rid=r.id) }}" target="_blank">Print report form (PDF)</a></p>
+{% if r.has_photo %}<h4 style="margin:16px 0 4px">Photo</h4><a href="{{ url_for('gso_photo', rid=r.id) }}" target="_blank"><img class="rp-photo" src="{{ url_for('gso_photo', rid=r.id) }}" alt="Photo of the damaged item"></a>{% endif %}</div>
+<div><div class="card"><h2>Update this report</h2><form method="post" action="{{ url_for('gso_update', rid=r.id) }}">{{ m.token() }}
+<label>Status</label><select name="status">{% for s in statuses %}<option {{ 'selected' if s == r.status }}>{{ s }}</option>{% endfor %}</select>
+<label>Note (required when rejecting)</label><textarea name="note" maxlength="600" placeholder="e.g. Technician assigned, will fix tomorrow."></textarea>
+<div class="ck" style="margin-top:8px"><label><input type="checkbox" name="public" value="1" checked> Show this note to the reporter on the tracking page</label></div><button>Save update</button></form></div>
+<div class="card"><h2>History</h2><ul class="rp-tl">{% for u in ups %}<li>{{ rm.badge(u.status) }} {% if u.note %}{{ u.note }}{% endif %}<small>{{ u.created_at|dt12 }} &middot; {{ u.by_name }}{% if not u.public %} &middot; internal note{% endif %}</small></li>{% endfor %}</ul>
+<form method="post" action="{{ url_for('gso_delete', rid=r.id) }}" onsubmit="return confirm('Delete this report permanently? Use this only for spam or duplicates.')">{{ m.token() }}<button class="sm r">Delete report</button></form></div></div></div>{% endblock %}"""
+
+# =====================================================================================================================
+# ADDED MODULE v2 - printable damage-report PDF, dark mode + lighter mobile pages, backup/export, late-return reminders, new calendar
+# =====================================================================================================================
+from markupsafe import escape as _esc
+import zipfile
+
+# ---- 1. Printable Damage Report form (PDF) ------------------------------------------------------------------------
+def rp_make_pdf(r):
+    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=A4); H = 297 * mm
+    ups = q("SELECT status,note,by_name,created_at FROM damage_updates WHERE report_id=? ORDER BY id", r["id"])
+    def T(t, x, y, s=10, b=False, a="l", i=False):
+        c.setFont("Helvetica-BoldOblique" if b and i else "Helvetica-Bold" if b else "Helvetica-Oblique" if i else "Helvetica", s)
+        (c.drawCentredString if a == "c" else c.drawString)(x * mm, H - y * mm, str(t or ""))
+    def L(x1, y, x2): c.line(x1 * mm, H - y * mm, x2 * mm, H - y * mm)
+    def R(x, y, w, h): c.rect(x * mm, H - (y + h) * mm, w * mm, h * mm)
+    def B(x, y, on):
+        R(x, y - 3.5, 4, 4)
+        if on: T("X", x + .8, y - .2, 9, True)
+    def fit(t, w, s=10, b=False):
+        t = str(t or ""); f = "Helvetica-Bold" if b else "Helvetica"
+        while t and c.stringWidth(t, f, s) > w * mm: t = t[:-1]
+        return t
+    for n, x in (("1", 28), ("2", 158)):
+        c.drawImage(ImageReader(io.BytesIO(base64.b64decode(LOGOS[n]))), x * mm, H - 34 * mm, 24 * mm, 24 * mm, mask="auto")
+    T("Southern Luzon State University", 105, 18, 13, True, "c"); T("Judge Guillermo Eleazar", 105, 23, 11, True, "c")
+    T("GENERAL SERVICES OFFICE", 105, 28, 9, False, "c"); T("Tagkawayan, Quezon", 105, 32, 8, False, "c")
+    R(135, 35, 60, 9); T("Report No:", 137, 39, 8); T(r["ticket"], 152, 42.5, 10, True)
+    T("DAMAGE / REPAIR REPORT FORM", 105, 52, 12, True, "c")
+    y = 62
+    T("Reported by:", 15, y); T(fit(r["reporter"], 76), 42, y - .5); L(40, y + 1, 120); T("Date filed:", 125, y); T(fit(dt12(r["created_at"]), 48, 9), 146, y - .5, 9); L(144, y + 1, 195); y += 8
+    T("College/Office:", 15, y); T(fit(r["dept"], 76), 42, y - .5); L(40, y + 1, 120); T("Contact:", 125, y); T(fit(r["contact"], 54, 9), 140, y - .5, 9); L(138, y + 1, 195); y += 8
+    T("Equipment/Item:", 15, y); T(fit(r["item"], 148), 45, y - .5); L(43, y + 1, 195); y += 8
+    T("Location:", 15, y); T(fit(r["location"], 160), 33, y - .5); L(31, y + 1, 195); y += 8
+    T("Type of problem:", 15, y); T(fit(r["problem"], 92, 9), 45, y - .5, 9); L(43, y + 1, 140); B(148, y, bool(r["urgent"])); T("URGENT / safety hazard", 154, y, 8); y += 9
+    T("Description of the problem:", 15, y, 10, True); y += 6
+    lines = simpleSplit(r["description"] or "", "Helvetica", 10, 178 * mm)[:6]
+    for k in range(6):
+        if k < len(lines): T(lines[k], 17, y + 5 * k)
+        L(15, y + 1 + 5 * k, 195)
+    y += 33
+    T("Photo:", 15, y, 9, True); R(15, y + 2, 90, 42)
+    ph = q1("SELECT photo FROM damage_reports WHERE id=?", r["id"])
+    drawn = False
+    if ph and ph["photo"]:
+        try:
+            c.drawImage(ImageReader(io.BytesIO(base64.b64decode(ph["photo"]))), 16 * mm, H - (y + 43) * mm, 88 * mm, 40 * mm, preserveAspectRatio=True, anchor="c"); drawn = True
+        except Exception: pass
+    if not drawn: T("No photo attached" if not (ph and ph["photo"]) else "(photo could not be printed)", 60, y + 24, 8, False, "c", True)
+    T("Status (GSO use):", 112, y, 9, True)
+    for k, s_ in enumerate(RP_STATUSES): B(114, y + 8 + 7 * k, r["status"] == s_); T(s_, 120, y + 8 + 7 * k, 9)
+    if r["resolved_at"]: T("Resolved on: " + dt12(r["resolved_at"]), 112, y + 38, 8)
+    y += 50
+    T("Action taken / Findings / Remarks (GSO):", 15, y, 9, True); y += 7
+    notes = [u for u in ups if u["note"] and u["by_name"] != "System"][-3:]
+    out = []
+    for u in notes: out += simpleSplit("%s [%s]: %s" % (dt12(u["created_at"]), u["status"], u["note"]), "Helvetica", 8, 176 * mm)
+    for k in range(4):
+        if k < len(out): T(out[k], 17, y + 7 * k - .5, 8)
+        L(15, y + 7 * k + 1, 195)
+    y += 36
+    L(15, y, 70); L(80, y, 135); L(145, y, 195)
+    T(fit(r["reporter"], 54, 9, True), 42.5, y - 1, 9, True, "c")
+    T("Reported by", 42.5, y + 4, 8, False, "c"); T("Received by (GSO staff) / Date", 107.5, y + 4, 8, False, "c"); T("Repaired by / Date", 170, y + 4, 8, False, "c")
+    y += 16
+    L(70, y, 140); T("RASELIETO B. GARCIA", 105, y - 1, 9, True, "c"); T("Head, General Services Office", 105, y + 4, 8, False, "c")
+    T("Printed: " + dt12(now_s()), 15, 288, 7, False, "l", True)
+    c.showPage(); c.save(); buf.seek(0); return buf
+
+@app.route("/gso/report/<int:rid>/pdf")
+@admin_required
+def gso_pdf(rid):
+    r = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+    if not r: abort(404)
+    return send_file(rp_make_pdf(r), mimetype="application/pdf", download_name="DamageReport-%s.pdf" % r["ticket"])
+
+# ---- 2. Dark mode + lighter pages on phones -----------------------------------------------------------------------
+try:
+    from PIL import Image as _PILImage
+    for _k in ("1", "2"):                       # the header logos are shown at ~60px, so a 140px copy is plenty (original: 300px)
+        _im = _PILImage.open(io.BytesIO(base64.b64decode(LOGOS[_k]))).convert("RGBA"); _im.thumbnail((140, 140))
+        _bf = io.BytesIO(); _im.save(_bf, "PNG", optimize=True); LOGOS[_k + "s"] = base64.b64encode(_bf.getvalue()).decode()
+except Exception:
+    LOGOS["1s"], LOGOS["2s"] = LOGOS["1"], LOGOS["2"]
+
+_BG_S = {}
+@app.route("/bg-s.jpg")
+def bg_small():
+    if "d" not in _BG_S:
+        try:
+            im = _PILImage.open(io.BytesIO(base64.b64decode(BG_IMG))).convert("RGB"); im.thumbnail((640, 640))
+            bf = io.BytesIO(); im.save(bf, "JPEG", quality=55, optimize=True, progressive=True); _BG_S["d"] = bf.getvalue()
+        except Exception:
+            _BG_S["d"] = base64.b64decode(BG_IMG)
+    return Response(_BG_S["d"], mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
+
+RP_DARK = """
+:root{--bgimg:url('/bg.jpg')}@media(max-width:800px){:root{--bgimg:url('/bg-s.jpg')}}
+body.authbg{--ov:rgba(255,255,255,.10)}body.dash{--ov:rgba(255,255,255,.55)}
+body.authbg::before,body.dash::before{background:linear-gradient(var(--ov),var(--ov)),var(--bgimg) center/cover no-repeat}
+html[data-theme=dark] body.authbg{--ov:rgba(8,14,20,.72)}html[data-theme=dark] body.dash{--ov:rgba(8,14,20,.84)}
+html[data-theme=dark]{color-scheme:dark;--bg:#0f1720;--card:#17212c;--tx:#e8eef5;--mu:#9fb0c0;--pr:#4a82cf;--bd:#2a3948}
+html[data-theme=dark] header{background:#12342a;color:#d8f3dc;border-bottom-color:#2d6a4f}html[data-theme=dark] header a,html[data-theme=dark] header button.lk{color:#d8f3dc}
+html[data-theme=dark] .authbg .card,html[data-theme=dark] .dash .card{background:rgba(23,33,44,.95)}
+html[data-theme=dark] .dash .tabs a{background:#17212c}html[data-theme=dark] .dash .tabs a.on{background:var(--pr)}
+html[data-theme=dark] .dash .wrap>p.mu,html[data-theme=dark] .dash .who{background:rgba(23,33,44,.92)}
+html[data-theme=dark] .modal,html[data-theme=dark] .npanel{background:#17212c;color:var(--tx)}html[data-theme=dark] .ni{border-bottom-color:var(--bd)}html[data-theme=dark] .ni:hover{background:#1e2c3a}html[data-theme=dark] .ni.new{background:#18301f}
+html[data-theme=dark] .bell{background:#17212c;color:#95d5b2}html[data-theme=dark] .badge{box-shadow:0 0 0 2px #17212c}
+html[data-theme=dark] .stat,html[data-theme=dark] .chips a{background:#1e2c3a;border-color:var(--bd);color:var(--tx)}html[data-theme=dark] .stat b{color:#95d5b2}html[data-theme=dark] .chips a.on,html[data-theme=dark] .chips a:hover{background:#2d6a4f;color:#fff}
+html[data-theme=dark] .g3 h4{color:#95d5b2}html[data-theme=dark] .tb tr:hover td{background:rgba(120,170,255,.08)}
+html[data-theme=dark] .rp-code{background:#102a20;border-color:#2d6a4f}html[data-theme=dark] .sc td.off{background:rgba(255,255,255,.03)}
+html[data-theme=dark] .msg.err{background:#4a1f1f;color:#ffd0d0}html[data-theme=dark] .msg.ok{background:#17402a;color:#c9f2d8}
+html[data-theme=dark] .cal i.Pending{color:#1b2333}
+#themeBtn{position:fixed;left:12px;bottom:14px;z-index:35;width:40px;height:40px;border-radius:50%;margin:0;padding:0;display:grid;place-items:center;background:#fff;color:#14532d;border:1px solid var(--bd);box-shadow:0 3px 10px rgba(0,0,0,.25)}
+#themeBtn svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+html[data-theme=dark] #themeBtn{background:#17212c;color:#ffd166}
+@media print{ #themeBtn{display:none}}
+"""
+RP_THEME_INIT = "<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>"
+RP_THEME_BTN = ('<button type="button" id="themeBtn" aria-label="Switch dark / light mode" title="Dark / light mode" onclick="var d=document.documentElement,t=d.getAttribute(\'data-theme\')===\'dark\'?\'light\':\'dark\';'
+                'd.setAttribute(\'data-theme\',t);try{localStorage.setItem(\'theme\',t)}catch(e){}">'
+                '<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>')
+_b = T["base.html"]
+_b = _b.replace("url_for('logo', n='1')", "url_for('logo', n='1s')").replace("url_for('logo', n='2')", "url_for('logo', n='2s')")
+_b = _b.replace("</style></head>", RP_DARK + "</style>" + RP_THEME_INIT + "</head>", 1)
+_b = _b.replace("</body></html>", RP_THEME_BTN + "</body></html>", 1)
+T["base.html"] = _b
+
+# ---- 3. Backup & export of all data (admin) -----------------------------------------------------------------------
+RP_BK = [("requests", "id,rfu_no,user_id,requester,dept,event,event_date,t1,t2,return_date,attendees,facilities,head,status,remarks,created_at,returned_at", "requests"),
+         ("request_items", "id,request_id,name,qty", "items"),
+         ("equipment_stock", "name,stock", "inventory"),
+         ("users", "id,username,fullname,student_no,role,created_at", "users"),
+         ("notifications", "id,user_id,request_id,kind,message,created_at,read_at", "notifications"),
+         ("damage_reports", "id,ticket,token,reporter,contact,dept,item,location,problem,urgent,description,photo_type,status,created_at,updated_at,resolved_at", "damage_reports"),
+         ("damage_updates", "id,report_id,status,note,public,by_name,created_at", "damage_updates")]
+RP_BK_LABELS = {"requests": "Facility / equipment requests", "request_items": "Equipment in each request", "equipment_stock": "Equipment stock list",
+                "users": "Users (no passwords)", "notifications": "Notifications", "damage_reports": "Damage reports", "damage_updates": "Damage report history"}
+
+def rp_bk_csv(name):
+    spec = next((x for x in RP_BK if x[0] == name), None)
+    if not spec: return None
+    cols = spec[1].split(",")
+    out = io.StringIO(); w = csv.writer(out); w.writerow(cols)
+    for r in q("SELECT %s FROM %s ORDER BY %s" % (spec[1], spec[2], cols[0])): w.writerow([rp_csv(r[k]) for k in cols])
+    return "﻿" + out.getvalue()
+
+@app.route("/gso/backup")
+@admin_required
+def gso_backup():
+    info = [(n, RP_BK_LABELS[n], q1("SELECT COUNT(*) FROM %s" % t)[0]) for n, _, t in RP_BK]
+    return render_template("gso_backup.html", info=info, tab="backup", cnt=rp_counts(), page_sub="General Services Office - Backup & Export")
+
+@app.route("/gso/backup/<name>.csv")
+@admin_required
+def gso_backup_csv(name):
+    data = rp_bk_csv(name)
+    if data is None: abort(404)
+    return Response(data, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=%s.csv" % name})
+
+@app.route("/gso/backup/full.zip")
+@admin_required
+def gso_backup_zip():
+    buf = io.BytesIO(); stamp = now_dt().strftime("%Y%m%d-%H%M")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, _, _t in RP_BK: z.writestr(n + ".csv", rp_bk_csv(n))
+        for r in q("SELECT id,ticket,photo_type FROM damage_reports WHERE photo IS NOT NULL ORDER BY id"):
+            p = q1("SELECT photo FROM damage_reports WHERE id=?", r["id"])
+            ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(r["photo_type"], "bin")
+            z.writestr("photos/%s.%s" % (r["ticket"], ext), base64.b64decode(p["photo"]))
+        z.writestr("README.txt", "SLSU-JGE GSO - data backup created %s (Philippine time).\r\n\r\nEach .csv file is one table; open them in Excel.\r\n"
+                   "photos/ holds the pictures attached to damage reports (named by ticket number).\r\nPasswords are NOT included.\r\n"
+                   "Keep this file private: it contains names, student numbers and contact details.\r\n" % now_s())
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name="slsu-gso-backup-%s.zip" % stamp)
+
+# ---- 4. Late-return reminders ---------------------------------------------------------------------------------------
+_RP_DUE = "(COALESCE(r.return_date,r.event_date)||' '||r.t2)"
+_RP_SEL = ("SELECT r.id,r.rfu_no,r.user_id,r.requester,r.dept,r.event,r.event_date,r.return_date,r.t2 FROM requests r WHERE r.status='Approved' AND r.returned_at IS NULL "
+           "AND EXISTS(SELECT 1 FROM items i WHERE i.request_id=r.id) AND ")
+def _rp_items(rid): return ", ".join("%s x%d" % (i["name"], i["qty"]) for i in q("SELECT name,qty FROM items WHERE request_id=?", rid))
+def rp_overdue(): return q(_RP_SEL + _RP_DUE + " < ? ORDER BY " + _RP_DUE, now_s())
+def rp_due_soon(): return q(_RP_SEL + _RP_DUE + " >= ? AND " + _RP_DUE + " <= ? ORDER BY " + _RP_DUE, now_s(), (now_dt() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"))
+def _rp_when(r): return dfmt(r["return_date"] or r["event_date"]) + " " + t12(r["t2"])
+
+RP_SWEEP = [0.0]
+@app.before_request
+def rp_sweep():
+    """Once a minute (when someone opens a dashboard) send each borrower ONE 'due soon' and ONE 'overdue' notification (their bell)."""
+    try:
+        if request.endpoint != "dashboard" or not g.get("user") or time.time() - RP_SWEEP[0] < 60: return
+        RP_SWEEP[0] = time.time()
+        for kind, rows in (("overdue", rp_overdue()), ("duesoon", rp_due_soon())):
+            for r in rows:
+                if q1("SELECT 1 FROM notifications WHERE request_id=? AND kind=?", r["id"], kind): continue
+                if kind == "overdue":
+                    msg = "REMINDER: Request %s - the borrowed equipment (%s) was due back on %s. Please return it to the GSO as soon as possible." % (r["rfu_no"], _rp_items(r["id"]), _rp_when(r))
+                else:
+                    msg = "Reminder: please return the borrowed equipment (%s) of request %s to the GSO by %s." % (_rp_items(r["id"]), r["rfu_no"], _rp_when(r))
+                notify(r["user_id"], r["id"], kind, msg)
+    except Exception as err:
+        print("rp_sweep:", err)
+
+@app.after_request
+def rp_overdue_banner(resp):
+    try:
+        if request.endpoint != "dashboard" or not g.get("user") or resp.status_code != 200 or resp.mimetype != "text/html": return resp
+        admin, tab = g.user["role"] == "admin", request.args.get("tab", "")
+        if tab not in (("", "pending", "approved") if admin else ("", "new", "mine")): return resp
+        rows = [r for r in rp_overdue() if admin or r["user_id"] == g.user["id"]]
+        if not rows: return resp
+        if admin:
+            body = ("<h2 style=\"color:#a63232\">Overdue returns (%d)</h2><p class=\"mu\">These approved requests passed their return time and the items are still marked as not returned.</p><div class=\"tb\"><table>"
+                    "<tr><th>RFU No.</th><th>Requester</th><th>Equipment</th><th>Was due</th></tr>%s</table></div>%s"
+                    "<a class=\"btn sm\" href=\"%s\">Open Approved tab</a>") % (
+                len(rows), "".join("<tr><td>%s</td><td>%s<br><span class=\"mu\">%s</span></td><td>%s</td><td>%s</td></tr>" % (_esc(r["rfu_no"]), _esc(r["requester"]), _esc(r["dept"]), _esc(_rp_items(r["id"])), _esc(_rp_when(r))) for r in rows[:6]),
+                ("<p class=\"mu\">...and %d more.</p>" % (len(rows) - 6)) if len(rows) > 6 else "", url_for("dashboard", tab="approved"))
+        else:
+            body = ("<h2 style=\"color:#a63232\">Please return the borrowed equipment</h2>" + "".join("<p style=\"margin:4px 0\"><b>%s</b>: %s - was due back on <b>%s</b>.</p>" % (_esc(r["rfu_no"]), _esc(_rp_items(r["id"])), _esc(_rp_when(r))) for r in rows)
+                    + "<p class=\"mu\">Return it to the GSO so others can use it.</p>")
+        resp.set_data(resp.get_data(as_text=True).replace('<div class="wrap">', '<div class="wrap"><div class="card" style="border-left:6px solid #a63232">' + body + "</div>", 1))
+    except Exception as err:
+        print("rp_overdue_banner:", err)
+    return resp
+
+# ---- 5. New calendar (replaces the Calendar tab: /dashboard?tab=cal now opens /schedule; old calendar code is untouched) ----
+@app.route("/schedule")
+@login_required
+def sched_page():
+    admin = g.user["role"] == "admin"
+    m = request.args.get("m") or today_ph().strftime("%Y-%m")
+    try: y, mo = int(m[:4]), int(m[5:7]); date(y, mo, 1)
+    except Exception: y, mo = today_ph().year, today_ph().month
+    ym = "%04d-%02d" % (y, mo); first, last = ym + "-01", "%s-%02d" % (ym, monthrange(y, mo)[1])
+    f, s_ = request.args.get("f", "all"), request.args.get("s", "all")
+    if f not in FACILITIES and f != "__equip": f = "all"
+    stq = "status='Approved'" if s_ == "ap" else "status IN ('Pending','Approved')"
+    days, total = {}, 0
+    for r in enrich(q("SELECT * FROM requests WHERE %s AND event_date<=? AND COALESCE(return_date,event_date)>=? ORDER BY event_date,t1" % stq, last, first)):
+        if f == "__equip" and not r["its"]: continue
+        if f in FACILITIES and f.lower() not in [x.lower() for x in r["fac"]]: continue
+        rd = r["return_date"] or r["event_date"]
+        known = [x for x in r["fac"] if x in FACILITIES]
+        cls = "c%d" % FACILITIES.index(f if f in FACILITIES else known[0]) if known else ("co" if r["fac"] else "ce")
+        total += 1
+        for dd in range(int(max(r["event_date"], first)[8:10]), int(min(rd, last)[8:10]) + 1):
+            key = "%s-%02d" % (ym, dd)
+            tl = ("%s - %s" % (t12(r["t1"]), t12(r["t2"]))) if rd == r["event_date"] else ("From " + t12(r["t1"])) if key == r["event_date"] else ("Until " + t12(r["t2"])) if key == rd else "All day"
+            e = dict(id=r["id"], event=r["event"], badge=r["badge"], time=tl, res=r["res"], cls=cls, rfu=r["rfu_no"], pend=r["badge"] == "Pending",
+                     short=("%s %s" % (t12(r["t1"]), r["event"])) if key == r["event_date"] else r["event"])
+            if admin: e.update(requester=r["requester"], dept=r["dept"], pdf=url_for("request_pdf", rid=r["id"]),
+                               link=url_for("dashboard", tab="returned" if r["returned_at"] else r["status"].lower()))
+            days.setdefault(dd, []).append(e)
+    py, pm = (y - 1, 12) if mo == 1 else (y, mo - 1); ny, nm = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    ctx = dict(tab="cal", admin=admin, weeks=Calendar(6).monthdayscalendar(y, mo), days=days, ym=ym, title=date(y, mo, 1).strftime("%B %Y"), total=total,
+               prev="%04d-%02d" % (py, pm), next="%04d-%02d" % (ny, nm), f=f, s=s_, facs=FACILITIES, today=today_ph().isoformat(), page_sub="General Services Office - Booking Calendar")
+    if admin:
+        ctx["cnt"] = {k: q1(sq)[0] for k, sq in {"pending": "SELECT COUNT(*) FROM requests WHERE status='Pending'", "approved": "SELECT COUNT(*) FROM requests WHERE status='Approved' AND returned_at IS NULL",
+                      "returned": "SELECT COUNT(*) FROM requests WHERE status='Approved' AND returned_at IS NOT NULL", "disapproved": "SELECT COUNT(*) FROM requests WHERE status='Disapproved'"}.items()}
+    else:
+        sc = student_ctx("x"); ctx.update(mine=sc["mine"], notifs=sc["notifs"], unread=sc["unread"])
+    return render_template("sched.html", **ctx)
+
+_old_dash = app.view_functions["dashboard"]
+def rp_dash():
+    if request.args.get("tab") == "cal" and g.get("user"):
+        return redirect(url_for("sched_page", m=request.args.get("m")) if request.args.get("m") else url_for("sched_page"))
+    return _old_dash()
+app.view_functions["dashboard"] = rp_dash
+
+RP_CSS += """
+.sc-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}.sc-bar select,.sc-bar input{width:auto;min-width:120px}.sc-bar .btn,.sc-bar button{margin:0}.sc-bar .gap{flex:1}
+table.sc{width:100%;table-layout:fixed;border-collapse:collapse}.sc th{text-align:center;font-size:12px;padding:6px 0;color:var(--mu);border-bottom:1px solid var(--bd)}
+.sc td{border:1px solid var(--bd);height:96px;vertical-align:top;padding:3px;cursor:pointer;overflow:hidden;font-size:11px}.sc td.off{cursor:default;background:rgba(0,0,0,.03)}
+.sc td:hover:not(.off){background:rgba(20,65,123,.08)}.sc td.sel{outline:2px solid var(--pr);outline-offset:-2px}
+.dn{display:inline-block;min-width:22px;height:22px;line-height:22px;text-align:center;font-weight:600;font-size:12px;border-radius:50%}.sc td.today .dn{background:var(--pr);color:#fff}
+.sc-chip{display:block;color:#fff;border-radius:3px;padding:1px 4px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+.c0{background:#14417b}.c1{background:#2b7a47}.c2{background:#b45309}.c3{background:#7b3fa0}.ce{background:#0f766e}.co{background:#5d6779}
+.sc-chip.pend{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.3) 0 5px,transparent 5px 10px);outline:1.5px dashed rgba(0,0,0,.4);outline-offset:-1.5px}
+.sc-more{font-size:11px;color:var(--mu);display:block;margin-top:2px}.sc-leg{display:flex;flex-wrap:wrap;gap:6px 14px;margin:12px 0 0;font-size:12.5px;color:var(--mu)}
+.sc-leg i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-2px}
+.sc-ev{border-left:6px solid;padding:8px 12px;margin:8px 0;border-radius:6px;background:rgba(127,127,127,.09)}.sc-ev b{font-size:15px}.sc-ev .mu{font-size:13px}
+@media(max-width:640px){.sc td{height:58px;padding:2px}.sc-chip{font-size:0;height:7px;width:7px;border-radius:50%;display:inline-block;margin:1px;padding:0}.sc-more{font-size:10px}.dn{min-width:20px;height:20px;line-height:20px}}
+"""
+app.jinja_env.globals["RPCSS"] = RP_CSS
+
+T["sched.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'macros.html' as m %}
+{% if admin %}{{ m.side([('__label','Requests',none,''),('pending','Pending',cnt.pending,'pending'),('approved','Approved',cnt.approved,'approved'),('returned','Returned',cnt.returned,'returned'),('disapproved','Disapproved',cnt.disapproved,'disapproved'),('__label','Manage',none,''),('cal','Calendar',none,'cal'),('stock','Equipment Stock',none,'stock'),('users','Users',none,'users'),('report','Monthly Report',none,'report')], 'cal') }}
+{% else %}{{ m.side([('new','New Request',none,'new'),('mine','My Requests',mine|length,'list'),('cal','Calendar',none,'cal')], 'cal') }}{{ m.bell(notifs, unread) }}{% endif %}
+<div class="card"><h2>Booking Calendar</h2>
+<div class="sc-bar"><a class="btn s" href="{{ url_for('sched_page', m=prev, f=f, s=s) }}">&lsaquo; Prev</a><a class="btn s" href="{{ url_for('sched_page', f=f, s=s) }}">Today</a><a class="btn s" href="{{ url_for('sched_page', m=next, f=f, s=s) }}">Next &rsaquo;</a>
+<b style="font-size:17px;margin-left:6px">{{ title }}</b><span class="mu">&middot; {{ total }} booking{{ 's' if total != 1 }}</span></div>
+<form method="get" class="sc-bar"><input type="month" name="m" value="{{ ym }}"><select name="f"><option value="all">All facilities &amp; equipment</option>{% for x in facs %}<option value="{{ x }}" {{ 'selected' if f == x }}>{{ x }}</option>{% endfor %}<option value="__equip" {{ 'selected' if f == '__equip' }}>Equipment borrowing only</option></select>
+<select name="s"><option value="all">Approved + pending</option><option value="ap" {{ 'selected' if s == 'ap' }}>Approved only</option></select><button>Apply</button></form>
+<table class="sc"><tr>{% for d in ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] %}<th>{{ d }}</th>{% endfor %}</tr>
+{% for w in weeks %}<tr>{% for d in w %}{% if d %}{% set evs = days.get(d, []) %}<td id="d{{ d }}" class="{{ 'today' if ym ~ '-' ~ ('%02d'|format(d)) == today }}" onclick="selDay({{ d }})"><span class="dn">{{ d }}</span>
+{% for e in evs[:3] %}<span class="sc-chip {{ e.cls }} {{ 'pend' if e.pend }}" title="{{ e.event }} - {{ e.time }}">{{ e.short }}</span>{% endfor %}{% if evs|length > 3 %}<span class="sc-more">+{{ evs|length - 3 }} more</span>{% endif %}</td>{% else %}<td class="off"></td>{% endif %}{% endfor %}</tr>{% endfor %}</table>
+<div class="sc-leg">{% for x in facs %}<span><i class="c{{ loop.index0 }}"></i>{{ x }}</span>{% endfor %}<span><i class="ce"></i>Equipment only</span><span><i class="co"></i>Other facility</span><span><i style="background:#888;background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.4) 0 3px,transparent 3px 6px)"></i>Pending (striped)</span></div></div>
+<div class="card" id="scPanel"></div>
+<script id="scdata" type="application/json">{{ days|tojson }}</script>
+<script>(function(){var D=JSON.parse(document.getElementById('scdata').textContent),ym={{ ym|tojson }},today={{ today|tojson }},ADMIN={{ 'true' if admin else 'false' }},
+COL={c0:'#14417b',c1:'#2b7a47',c2:'#b45309',c3:'#7b3fa0',ce:'#0f766e',co:'#5d6779'},sel=null;
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+window.selDay=function(d){var el=document.getElementById('d'+d);if(!el)return;if(sel)sel.classList.remove('sel');el.classList.add('sel');sel=el;
+ var dt=new Date(ym+'-'+('0'+d).slice(-2)+'T00:00:00'),ev=D[d]||[],h='<h2>'+esc(dt.toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'}))+'</h2>';
+ if(!ev.length)h+='<p class="mu" style="font-size:14px">Nothing is booked on this day with the current filter - it looks free.</p>';
+ ev.forEach(function(e){h+='<div class="sc-ev" style="border-color:'+COL[e.cls]+'"><b>'+esc(e.event)+'</b> <span class="b '+esc(e.badge)+'">'+esc(e.badge)+'</span><br><span class="mu">'+esc(e.time)+' &middot; '+esc(e.res)+'</span>';
+  if(ADMIN)h+='<br><span class="mu">'+esc(e.requester)+' ('+esc(e.dept)+') &middot; RFU '+esc(e.rfu)+'</span><br><a href="'+esc(e.pdf)+'">PDF form</a> &middot; <a href="'+esc(e.link)+'">View in list</a>';
+  h+='</div>'});
+ document.getElementById('scPanel').innerHTML=h};
+var t=today.slice(0,7)===ym?parseInt(today.slice(8),10):1;selDay(t)})()</script>{% endblock %}"""
+
+
+rp_init()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reset-admin":
