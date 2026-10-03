@@ -1140,7 +1140,7 @@ def rp_link(path): return (os.environ.get("APP_URL", "").rstrip("/") + path) if 
 
 def rp_csv(x):
     x = "" if x is None else str(x)
-    return "'" + x if x[:1] in ("=", "+", "-", "@") else x      # stops spreadsheet formula injection from public input
+    return "'" + x if len(x) > 1 and x[:1] in ("=", "+", "-", "@") else x      # stops spreadsheet formula injection from public input
 
 # ---- public: report form -------------------------------------------------------------------------------------------
 @app.route("/report", methods=["GET", "POST"])
@@ -1279,6 +1279,20 @@ def gso_export():
                                         r["description"], r["reporter"], r["contact"], r["dept"], r["resolved_at"])])
     return Response("﻿" + out.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=damage-reports.csv"})
 
+# Compress pages (HTML/CSV/JSON) to make them lighter on phones. Registered BEFORE the other after_request helpers so it runs LAST.
+import gzip
+@app.after_request
+def rp_gzip(resp):
+    try:
+        if (resp.status_code == 200 and not resp.direct_passthrough and "gzip" in request.headers.get("Accept-Encoding", "")
+                and "Content-Encoding" not in resp.headers and resp.mimetype in ("text/html", "text/css", "text/csv", "application/json")):
+            data = resp.get_data()
+            if len(data) > 1024:
+                resp.set_data(gzip.compress(data, 6)); resp.headers["Content-Encoding"] = "gzip"; resp.headers.add("Vary", "Accept-Encoding")
+    except Exception:
+        pass
+    return resp
+
 # Small "Report broken equipment" button, top-right under the header, on the sign-in page only (login page code is not edited).
 @app.after_request
 def rp_login_button(resp):
@@ -1311,7 +1325,13 @@ _b = T["base.html"]          # lets the new pages set their own browser-tab titl
 _b = _b.replace("<title>Facility &amp; Equipment Request - SLSU</title>", "<title>{{ page_title|default('Facility &amp; Equipment Request - SLSU')|safe }}</title>")
 _b = _b.replace("<small>General Services Office - Facility &amp; Equipment Request</small>", "<small>{{ page_sub|default('General Services Office - Facility &amp; Equipment Request')|safe }}</small>")
 _b = _b.replace("'authbg' if request.endpoint in ('login',", "'authbg' if request.endpoint in ('rp_form', 'rp_done', 'rp_track', 'login',")
-_b = _b.replace("'dash' if request.endpoint in (", "'dash' if (request.endpoint or '').startswith('gso_') or request.endpoint in (")
+_b = _b.replace("'dash' if request.endpoint in (", "'dash' if (request.endpoint or '').startswith(('gso_', 'sched_')) or request.endpoint in (")
+# Fixed background that never moves while scrolling (the old "background-attachment: fixed" is ignored by many phones/browsers,
+# so the picture is drawn on a fixed layer behind the page instead). Applies to the login pages and all dashboards.
+_b = _b.replace("</style></head>", """body.authbg,body.dash{background:var(--bg)!important}
+body.authbg::before,body.dash::before{content:"";position:fixed;top:0;left:0;width:100%;height:100%;z-index:-1;pointer-events:none;background:linear-gradient(rgba(255,255,255,.10),rgba(255,255,255,.10)),url('/bg.jpg') center/cover no-repeat}
+body.dash::before{background:linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url('/bg.jpg') center/cover no-repeat}
+</style></head>""", 1)
 T["base.html"] = _b
 
 RP_CSS = """
@@ -1343,8 +1363,8 @@ T["rp_macros.html"] = """
 {% macro gside(tab, cnt) %}<button type="button" class="menubtn" onclick="menu(true)" aria-label="Open menu">{{ ico('menu') }}</button><div id="sideBg" class="sideBg" onclick="menu(false)"></div>
 <nav id="side" class="side"><div class="sideuser"><div class="av">{{ (g.user.fullname or '?')[:1]|upper }}</div><div class="who2"><b>{{ g.user.fullname }}</b><span>Damage Reports</span></div><button type="button" class="x" onclick="menu(false)" aria-label="Close menu">{{ ico('x') }}</button></div>
 <div class="navlabel" style="--i:1">Damage reports</div>
-{% for k, label, n, ic in [('new','New',cnt['new'],'bell'),('progress','In Progress',cnt['progress'],'pending'),('resolved','Resolved',cnt['resolved'],'approved'),('rejected','Rejected',cnt['rejected'],'disapproved'),('all','All reports',cnt['all'],'list'),('summary','Summary',none,'report')] %}
-<a class="nav {{ 'on' if tab == k }}" style="--i:{{ loop.index + 1 }}" href="{{ url_for('gso_dash', tab=k) }}">{{ ico(ic) }}<span>{{ label }}</span>{% if n is not none %}<span class="cnt" {% if k == 'new' %}id="gsoNew"{% endif %}>{{ n }}</span>{% endif %}</a>{% endfor %}
+{% for k, label, n, ic in [('new','New',cnt['new'],'bell'),('progress','In Progress',cnt['progress'],'pending'),('resolved','Resolved',cnt['resolved'],'approved'),('rejected','Rejected',cnt['rejected'],'disapproved'),('all','All reports',cnt['all'],'list'),('summary','Summary',none,'report'),('backup','Backup &amp; export',none,'stock')] %}
+<a class="nav {{ 'on' if tab == k }}" style="--i:{{ loop.index + 1 }}" href="{{ url_for('gso_backup') if k == 'backup' else url_for('gso_dash', tab=k) }}">{{ ico(ic) }}<span>{{ label }}</span>{% if n is not none %}<span class="cnt" {% if k == 'new' %}id="gsoNew"{% endif %}>{{ n }}</span>{% endif %}</a>{% endfor %}
 <div class="navlabel" style="--i:8">Other system</div>
 <a class="nav" style="--i:9" href="{{ url_for('dashboard') }}">{{ ico('stock') }}<span>Facility &amp; Equipment</span></a>
 <div class="foot"><a class="nav" href="{{ url_for('account') }}">{{ ico('lock') }}<span>Change password</span></a><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="signout">{{ ico('out') }}<span>Sign out</span></button></form></div></nav>
@@ -1405,12 +1425,18 @@ T["gso_dash.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_
 {% for x in rows %}<tr><td><a href="{{ url_for('gso_view', rid=x.id) }}">{{ x.ticket }}</a>{% if x.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</td><td><b>{{ x.item }}</b><br><span class="mu">{{ x.problem }}</span></td><td>{{ x.location }}</td><td>{{ x.reporter }}<br><span class="mu">{{ x.contact }}</span></td><td>{{ x.created_at|dt12 }}</td><td>{{ rm.badge(x.status) }}</td><td><a class="btn sm" href="{{ url_for('gso_view', rid=x.id) }}">Open</a></td></tr>
 {% else %}<tr><td colspan="7">No reports here.</td></tr>{% endfor %}</table></div></div>{% endif %}{% endblock %}"""
 
+T["gso_backup.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{{ rm.gside(tab, cnt) }}
+<div class="card"><h2>Backup &amp; Export</h2><p class="mu" style="font-size:14px">Download a copy of all the system's data (requests, equipment stock, users without passwords, notifications and damage reports with photos). Keep the file private - it contains names, student numbers and contact details.</p>
+<a class="btn" href="{{ url_for('gso_backup_zip') }}">Download full backup (.zip)</a>
+<div class="tb" style="margin-top:14px"><table><tr><th>Data</th><th>Records</th><th></th></tr>{% for n, label, c in info %}<tr><td>{{ label }}</td><td>{{ c }}</td><td><a class="btn s sm" href="{{ url_for('gso_backup_csv', name=n) }}">Download CSV</a></td></tr>{% endfor %}</table></div></div>{% endblock %}"""
+
 T["gso_view.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{% import 'macros.html' as m %}{{ rm.gside(tab, cnt) }}
 <p><a href="{{ url_for('gso_dash', tab='new') }}">&lsaquo; Back to reports</a></p>
 <div class="rp-2"><div class="card"><h2>{{ r.ticket }} {% if r.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</h2><p style="margin:-6px 0 12px">{{ rm.badge(r.status) }}</p>
 <dl class="rp-dl"><dt>Item</dt><dd><b>{{ r.item }}</b></dd><dt>Problem type</dt><dd>{{ r.problem }}</dd><dt>Location</dt><dd>{{ r.location }}</dd><dt>Description</dt><dd style="white-space:pre-wrap">{{ r.description }}</dd>
 <dt>Reported by</dt><dd>{{ r.reporter }}</dd><dt>Contact</dt><dd>{{ r.contact }}</dd><dt>College / Office</dt><dd>{{ r.dept or '-' }}</dd><dt>Date filed</dt><dd>{{ r.created_at|dt12 }}</dd>{% if r.resolved_at %}<dt>Resolved on</dt><dd>{{ r.resolved_at|dt12 }}</dd>{% endif %}
 <dt>Tracking code</dt><dd style="font-family:monospace">{{ r.ticket }}-{{ r.token }}</dd></dl>
+<p style="margin:14px 0 0"><a class="btn" href="{{ url_for('gso_pdf', rid=r.id) }}" target="_blank">Print report form (PDF)</a></p>
 {% if r.has_photo %}<h4 style="margin:16px 0 4px">Photo</h4><a href="{{ url_for('gso_photo', rid=r.id) }}" target="_blank"><img class="rp-photo" src="{{ url_for('gso_photo', rid=r.id) }}" alt="Photo of the damaged item"></a>{% endif %}</div>
 <div><div class="card"><h2>Update this report</h2><form method="post" action="{{ url_for('gso_update', rid=r.id) }}">{{ m.token() }}
 <label>Status</label><select name="status">{% for s in statuses %}<option {{ 'selected' if s == r.status }}>{{ s }}</option>{% endfor %}</select>
@@ -1418,6 +1444,318 @@ T["gso_view.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_
 <div class="ck" style="margin-top:8px"><label><input type="checkbox" name="public" value="1" checked> Show this note to the reporter on the tracking page</label></div><button>Save update</button></form></div>
 <div class="card"><h2>History</h2><ul class="rp-tl">{% for u in ups %}<li>{{ rm.badge(u.status) }} {% if u.note %}{{ u.note }}{% endif %}<small>{{ u.created_at|dt12 }} &middot; {{ u.by_name }}{% if not u.public %} &middot; internal note{% endif %}</small></li>{% endfor %}</ul>
 <form method="post" action="{{ url_for('gso_delete', rid=r.id) }}" onsubmit="return confirm('Delete this report permanently? Use this only for spam or duplicates.')">{{ m.token() }}<button class="sm r">Delete report</button></form></div></div></div>{% endblock %}"""
+
+# =====================================================================================================================
+# ADDED MODULE v2 - printable damage-report PDF, dark mode + lighter mobile pages, backup/export, late-return reminders, new calendar
+# =====================================================================================================================
+from markupsafe import escape as _esc
+import zipfile
+
+# ---- 1. Printable Damage Report form (PDF) ------------------------------------------------------------------------
+def rp_make_pdf(r):
+    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=A4); H = 297 * mm
+    ups = q("SELECT status,note,by_name,created_at FROM damage_updates WHERE report_id=? ORDER BY id", r["id"])
+    def T(t, x, y, s=10, b=False, a="l", i=False):
+        c.setFont("Helvetica-BoldOblique" if b and i else "Helvetica-Bold" if b else "Helvetica-Oblique" if i else "Helvetica", s)
+        (c.drawCentredString if a == "c" else c.drawString)(x * mm, H - y * mm, str(t or ""))
+    def L(x1, y, x2): c.line(x1 * mm, H - y * mm, x2 * mm, H - y * mm)
+    def R(x, y, w, h): c.rect(x * mm, H - (y + h) * mm, w * mm, h * mm)
+    def B(x, y, on):
+        R(x, y - 3.5, 4, 4)
+        if on: T("X", x + .8, y - .2, 9, True)
+    def fit(t, w, s=10, b=False):
+        t = str(t or ""); f = "Helvetica-Bold" if b else "Helvetica"
+        while t and c.stringWidth(t, f, s) > w * mm: t = t[:-1]
+        return t
+    for n, x in (("1", 28), ("2", 158)):
+        c.drawImage(ImageReader(io.BytesIO(base64.b64decode(LOGOS[n]))), x * mm, H - 34 * mm, 24 * mm, 24 * mm, mask="auto")
+    T("Southern Luzon State University", 105, 18, 13, True, "c"); T("Judge Guillermo Eleazar", 105, 23, 11, True, "c")
+    T("GENERAL SERVICES OFFICE", 105, 28, 9, False, "c"); T("Tagkawayan, Quezon", 105, 32, 8, False, "c")
+    R(135, 35, 60, 9); T("Report No:", 137, 39, 8); T(r["ticket"], 152, 42.5, 10, True)
+    T("DAMAGE / REPAIR REPORT FORM", 105, 52, 12, True, "c")
+    y = 62
+    T("Reported by:", 15, y); T(fit(r["reporter"], 76), 42, y - .5); L(40, y + 1, 120); T("Date filed:", 125, y); T(fit(dt12(r["created_at"]), 48, 9), 146, y - .5, 9); L(144, y + 1, 195); y += 8
+    T("College/Office:", 15, y); T(fit(r["dept"], 76), 42, y - .5); L(40, y + 1, 120); T("Contact:", 125, y); T(fit(r["contact"], 54, 9), 140, y - .5, 9); L(138, y + 1, 195); y += 8
+    T("Equipment/Item:", 15, y); T(fit(r["item"], 148), 45, y - .5); L(43, y + 1, 195); y += 8
+    T("Location:", 15, y); T(fit(r["location"], 160), 33, y - .5); L(31, y + 1, 195); y += 8
+    T("Type of problem:", 15, y); T(fit(r["problem"], 92, 9), 45, y - .5, 9); L(43, y + 1, 140); B(148, y, bool(r["urgent"])); T("URGENT / safety hazard", 154, y, 8); y += 9
+    T("Description of the problem:", 15, y, 10, True); y += 6
+    lines = simpleSplit(r["description"] or "", "Helvetica", 10, 178 * mm)[:6]
+    for k in range(6):
+        if k < len(lines): T(lines[k], 17, y + 5 * k)
+        L(15, y + 1 + 5 * k, 195)
+    y += 33
+    T("Photo:", 15, y, 9, True); R(15, y + 2, 90, 42)
+    ph = q1("SELECT photo FROM damage_reports WHERE id=?", r["id"])
+    drawn = False
+    if ph and ph["photo"]:
+        try:
+            c.drawImage(ImageReader(io.BytesIO(base64.b64decode(ph["photo"]))), 16 * mm, H - (y + 43) * mm, 88 * mm, 40 * mm, preserveAspectRatio=True, anchor="c"); drawn = True
+        except Exception: pass
+    if not drawn: T("No photo attached" if not (ph and ph["photo"]) else "(photo could not be printed)", 60, y + 24, 8, False, "c", True)
+    T("Status (GSO use):", 112, y, 9, True)
+    for k, s_ in enumerate(RP_STATUSES): B(114, y + 8 + 7 * k, r["status"] == s_); T(s_, 120, y + 8 + 7 * k, 9)
+    if r["resolved_at"]: T("Resolved on: " + dt12(r["resolved_at"]), 112, y + 38, 8)
+    y += 50
+    T("Action taken / Findings / Remarks (GSO):", 15, y, 9, True); y += 7
+    notes = [u for u in ups if u["note"] and u["by_name"] != "System"][-3:]
+    out = []
+    for u in notes: out += simpleSplit("%s [%s]: %s" % (dt12(u["created_at"]), u["status"], u["note"]), "Helvetica", 8, 176 * mm)
+    for k in range(4):
+        if k < len(out): T(out[k], 17, y + 7 * k - .5, 8)
+        L(15, y + 7 * k + 1, 195)
+    y += 36
+    L(15, y, 70); L(80, y, 135); L(145, y, 195)
+    T(fit(r["reporter"], 54, 9, True), 42.5, y - 1, 9, True, "c")
+    T("Reported by", 42.5, y + 4, 8, False, "c"); T("Received by (GSO staff) / Date", 107.5, y + 4, 8, False, "c"); T("Repaired by / Date", 170, y + 4, 8, False, "c")
+    y += 16
+    L(70, y, 140); T("RASELIETO B. GARCIA", 105, y - 1, 9, True, "c"); T("Head, General Services Office", 105, y + 4, 8, False, "c")
+    T("Printed: " + dt12(now_s()), 15, 288, 7, False, "l", True)
+    c.showPage(); c.save(); buf.seek(0); return buf
+
+@app.route("/gso/report/<int:rid>/pdf")
+@admin_required
+def gso_pdf(rid):
+    r = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+    if not r: abort(404)
+    return send_file(rp_make_pdf(r), mimetype="application/pdf", download_name="DamageReport-%s.pdf" % r["ticket"])
+
+# ---- 2. Dark mode + lighter pages on phones -----------------------------------------------------------------------
+try:
+    from PIL import Image as _PILImage
+    for _k in ("1", "2"):                       # the header logos are shown at ~60px, so a 140px copy is plenty (original: 300px)
+        _im = _PILImage.open(io.BytesIO(base64.b64decode(LOGOS[_k]))).convert("RGBA"); _im.thumbnail((140, 140))
+        _bf = io.BytesIO(); _im.save(_bf, "PNG", optimize=True); LOGOS[_k + "s"] = base64.b64encode(_bf.getvalue()).decode()
+except Exception:
+    LOGOS["1s"], LOGOS["2s"] = LOGOS["1"], LOGOS["2"]
+
+_BG_S = {}
+@app.route("/bg-s.jpg")
+def bg_small():
+    if "d" not in _BG_S:
+        try:
+            im = _PILImage.open(io.BytesIO(base64.b64decode(BG_IMG))).convert("RGB"); im.thumbnail((640, 640))
+            bf = io.BytesIO(); im.save(bf, "JPEG", quality=55, optimize=True, progressive=True); _BG_S["d"] = bf.getvalue()
+        except Exception:
+            _BG_S["d"] = base64.b64decode(BG_IMG)
+    return Response(_BG_S["d"], mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
+
+RP_DARK = """
+:root{--bgimg:url('/bg.jpg')}@media(max-width:800px){:root{--bgimg:url('/bg-s.jpg')}}
+body.authbg{--ov:rgba(255,255,255,.10)}body.dash{--ov:rgba(255,255,255,.55)}
+body.authbg::before,body.dash::before{background:linear-gradient(var(--ov),var(--ov)),var(--bgimg) center/cover no-repeat}
+html[data-theme=dark] body.authbg{--ov:rgba(8,14,20,.72)}html[data-theme=dark] body.dash{--ov:rgba(8,14,20,.84)}
+html[data-theme=dark]{color-scheme:dark;--bg:#0f1720;--card:#17212c;--tx:#e8eef5;--mu:#9fb0c0;--pr:#4a82cf;--bd:#2a3948}
+html[data-theme=dark] header{background:#12342a;color:#d8f3dc;border-bottom-color:#2d6a4f}html[data-theme=dark] header a,html[data-theme=dark] header button.lk{color:#d8f3dc}
+html[data-theme=dark] .authbg .card,html[data-theme=dark] .dash .card{background:rgba(23,33,44,.95)}
+html[data-theme=dark] .dash .tabs a{background:#17212c}html[data-theme=dark] .dash .tabs a.on{background:var(--pr)}
+html[data-theme=dark] .dash .wrap>p.mu,html[data-theme=dark] .dash .who{background:rgba(23,33,44,.92)}
+html[data-theme=dark] .modal,html[data-theme=dark] .npanel{background:#17212c;color:var(--tx)}html[data-theme=dark] .ni{border-bottom-color:var(--bd)}html[data-theme=dark] .ni:hover{background:#1e2c3a}html[data-theme=dark] .ni.new{background:#18301f}
+html[data-theme=dark] .bell{background:#17212c;color:#95d5b2}html[data-theme=dark] .badge{box-shadow:0 0 0 2px #17212c}
+html[data-theme=dark] .stat,html[data-theme=dark] .chips a{background:#1e2c3a;border-color:var(--bd);color:var(--tx)}html[data-theme=dark] .stat b{color:#95d5b2}html[data-theme=dark] .chips a.on,html[data-theme=dark] .chips a:hover{background:#2d6a4f;color:#fff}
+html[data-theme=dark] .g3 h4{color:#95d5b2}html[data-theme=dark] .tb tr:hover td{background:rgba(120,170,255,.08)}
+html[data-theme=dark] .rp-code{background:#102a20;border-color:#2d6a4f}html[data-theme=dark] .sc td.off{background:rgba(255,255,255,.03)}
+html[data-theme=dark] .msg.err{background:#4a1f1f;color:#ffd0d0}html[data-theme=dark] .msg.ok{background:#17402a;color:#c9f2d8}
+html[data-theme=dark] .cal i.Pending{color:#1b2333}
+#themeBtn{position:fixed;left:12px;bottom:14px;z-index:35;width:40px;height:40px;border-radius:50%;margin:0;padding:0;display:grid;place-items:center;background:#fff;color:#14532d;border:1px solid var(--bd);box-shadow:0 3px 10px rgba(0,0,0,.25)}
+#themeBtn svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+html[data-theme=dark] #themeBtn{background:#17212c;color:#ffd166}
+@media print{ #themeBtn{display:none}}
+"""
+RP_THEME_INIT = "<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>"
+RP_THEME_BTN = ('<button type="button" id="themeBtn" aria-label="Switch dark / light mode" title="Dark / light mode" onclick="var d=document.documentElement,t=d.getAttribute(\'data-theme\')===\'dark\'?\'light\':\'dark\';'
+                'd.setAttribute(\'data-theme\',t);try{localStorage.setItem(\'theme\',t)}catch(e){}">'
+                '<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>')
+_b = T["base.html"]
+_b = _b.replace("url_for('logo', n='1')", "url_for('logo', n='1s')").replace("url_for('logo', n='2')", "url_for('logo', n='2s')")
+_b = _b.replace("</style></head>", RP_DARK + "</style>" + RP_THEME_INIT + "</head>", 1)
+_b = _b.replace("</body></html>", RP_THEME_BTN + "</body></html>", 1)
+T["base.html"] = _b
+
+# ---- 3. Backup & export of all data (admin) -----------------------------------------------------------------------
+RP_BK = [("requests", "id,rfu_no,user_id,requester,dept,event,event_date,t1,t2,return_date,attendees,facilities,head,status,remarks,created_at,returned_at", "requests"),
+         ("request_items", "id,request_id,name,qty", "items"),
+         ("equipment_stock", "name,stock", "inventory"),
+         ("users", "id,username,fullname,student_no,role,created_at", "users"),
+         ("notifications", "id,user_id,request_id,kind,message,created_at,read_at", "notifications"),
+         ("damage_reports", "id,ticket,token,reporter,contact,dept,item,location,problem,urgent,description,photo_type,status,created_at,updated_at,resolved_at", "damage_reports"),
+         ("damage_updates", "id,report_id,status,note,public,by_name,created_at", "damage_updates")]
+RP_BK_LABELS = {"requests": "Facility / equipment requests", "request_items": "Equipment in each request", "equipment_stock": "Equipment stock list",
+                "users": "Users (no passwords)", "notifications": "Notifications", "damage_reports": "Damage reports", "damage_updates": "Damage report history"}
+
+def rp_bk_csv(name):
+    spec = next((x for x in RP_BK if x[0] == name), None)
+    if not spec: return None
+    cols = spec[1].split(",")
+    out = io.StringIO(); w = csv.writer(out); w.writerow(cols)
+    for r in q("SELECT %s FROM %s ORDER BY %s" % (spec[1], spec[2], cols[0])): w.writerow([rp_csv(r[k]) for k in cols])
+    return "﻿" + out.getvalue()
+
+@app.route("/gso/backup")
+@admin_required
+def gso_backup():
+    info = [(n, RP_BK_LABELS[n], q1("SELECT COUNT(*) FROM %s" % t)[0]) for n, _, t in RP_BK]
+    return render_template("gso_backup.html", info=info, tab="backup", cnt=rp_counts(), page_sub="General Services Office - Backup & Export")
+
+@app.route("/gso/backup/<name>.csv")
+@admin_required
+def gso_backup_csv(name):
+    data = rp_bk_csv(name)
+    if data is None: abort(404)
+    return Response(data, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=%s.csv" % name})
+
+@app.route("/gso/backup/full.zip")
+@admin_required
+def gso_backup_zip():
+    buf = io.BytesIO(); stamp = now_dt().strftime("%Y%m%d-%H%M")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, _, _t in RP_BK: z.writestr(n + ".csv", rp_bk_csv(n))
+        for r in q("SELECT id,ticket,photo_type FROM damage_reports WHERE photo IS NOT NULL ORDER BY id"):
+            p = q1("SELECT photo FROM damage_reports WHERE id=?", r["id"])
+            ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(r["photo_type"], "bin")
+            z.writestr("photos/%s.%s" % (r["ticket"], ext), base64.b64decode(p["photo"]))
+        z.writestr("README.txt", "SLSU-JGE GSO - data backup created %s (Philippine time).\r\n\r\nEach .csv file is one table; open them in Excel.\r\n"
+                   "photos/ holds the pictures attached to damage reports (named by ticket number).\r\nPasswords are NOT included.\r\n"
+                   "Keep this file private: it contains names, student numbers and contact details.\r\n" % now_s())
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name="slsu-gso-backup-%s.zip" % stamp)
+
+# ---- 4. Late-return reminders ---------------------------------------------------------------------------------------
+_RP_DUE = "(COALESCE(r.return_date,r.event_date)||' '||r.t2)"
+_RP_SEL = ("SELECT r.id,r.rfu_no,r.user_id,r.requester,r.dept,r.event,r.event_date,r.return_date,r.t2 FROM requests r WHERE r.status='Approved' AND r.returned_at IS NULL "
+           "AND EXISTS(SELECT 1 FROM items i WHERE i.request_id=r.id) AND ")
+def _rp_items(rid): return ", ".join("%s x%d" % (i["name"], i["qty"]) for i in q("SELECT name,qty FROM items WHERE request_id=?", rid))
+def rp_overdue(): return q(_RP_SEL + _RP_DUE + " < ? ORDER BY " + _RP_DUE, now_s())
+def rp_due_soon(): return q(_RP_SEL + _RP_DUE + " >= ? AND " + _RP_DUE + " <= ? ORDER BY " + _RP_DUE, now_s(), (now_dt() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"))
+def _rp_when(r): return dfmt(r["return_date"] or r["event_date"]) + " " + t12(r["t2"])
+
+RP_SWEEP = [0.0]
+@app.before_request
+def rp_sweep():
+    """Once a minute (when someone opens a dashboard) send each borrower ONE 'due soon' and ONE 'overdue' notification (their bell)."""
+    try:
+        if request.endpoint != "dashboard" or not g.get("user") or time.time() - RP_SWEEP[0] < 60: return
+        RP_SWEEP[0] = time.time()
+        for kind, rows in (("overdue", rp_overdue()), ("duesoon", rp_due_soon())):
+            for r in rows:
+                if q1("SELECT 1 FROM notifications WHERE request_id=? AND kind=?", r["id"], kind): continue
+                if kind == "overdue":
+                    msg = "REMINDER: Request %s - the borrowed equipment (%s) was due back on %s. Please return it to the GSO as soon as possible." % (r["rfu_no"], _rp_items(r["id"]), _rp_when(r))
+                else:
+                    msg = "Reminder: please return the borrowed equipment (%s) of request %s to the GSO by %s." % (_rp_items(r["id"]), r["rfu_no"], _rp_when(r))
+                notify(r["user_id"], r["id"], kind, msg)
+    except Exception as err:
+        print("rp_sweep:", err)
+
+@app.after_request
+def rp_overdue_banner(resp):
+    try:
+        if request.endpoint != "dashboard" or not g.get("user") or resp.status_code != 200 or resp.mimetype != "text/html": return resp
+        admin, tab = g.user["role"] == "admin", request.args.get("tab", "")
+        if tab not in (("", "pending", "approved") if admin else ("", "new", "mine")): return resp
+        rows = [r for r in rp_overdue() if admin or r["user_id"] == g.user["id"]]
+        if not rows: return resp
+        if admin:
+            body = ("<h2 style=\"color:#a63232\">Overdue returns (%d)</h2><p class=\"mu\">These approved requests passed their return time and the items are still marked as not returned.</p><div class=\"tb\"><table>"
+                    "<tr><th>RFU No.</th><th>Requester</th><th>Equipment</th><th>Was due</th></tr>%s</table></div>%s"
+                    "<a class=\"btn sm\" href=\"%s\">Open Approved tab</a>") % (
+                len(rows), "".join("<tr><td>%s</td><td>%s<br><span class=\"mu\">%s</span></td><td>%s</td><td>%s</td></tr>" % (_esc(r["rfu_no"]), _esc(r["requester"]), _esc(r["dept"]), _esc(_rp_items(r["id"])), _esc(_rp_when(r))) for r in rows[:6]),
+                ("<p class=\"mu\">...and %d more.</p>" % (len(rows) - 6)) if len(rows) > 6 else "", url_for("dashboard", tab="approved"))
+        else:
+            body = ("<h2 style=\"color:#a63232\">Please return the borrowed equipment</h2>" + "".join("<p style=\"margin:4px 0\"><b>%s</b>: %s - was due back on <b>%s</b>.</p>" % (_esc(r["rfu_no"]), _esc(_rp_items(r["id"])), _esc(_rp_when(r))) for r in rows)
+                    + "<p class=\"mu\">Return it to the GSO so others can use it.</p>")
+        resp.set_data(resp.get_data(as_text=True).replace('<div class="wrap">', '<div class="wrap"><div class="card" style="border-left:6px solid #a63232">' + body + "</div>", 1))
+    except Exception as err:
+        print("rp_overdue_banner:", err)
+    return resp
+
+# ---- 5. New calendar (replaces the Calendar tab: /dashboard?tab=cal now opens /schedule; old calendar code is untouched) ----
+@app.route("/schedule")
+@login_required
+def sched_page():
+    admin = g.user["role"] == "admin"
+    m = request.args.get("m") or today_ph().strftime("%Y-%m")
+    try: y, mo = int(m[:4]), int(m[5:7]); date(y, mo, 1)
+    except Exception: y, mo = today_ph().year, today_ph().month
+    ym = "%04d-%02d" % (y, mo); first, last = ym + "-01", "%s-%02d" % (ym, monthrange(y, mo)[1])
+    f, s_ = request.args.get("f", "all"), request.args.get("s", "all")
+    if f not in FACILITIES and f != "__equip": f = "all"
+    stq = "status='Approved'" if s_ == "ap" else "status IN ('Pending','Approved')"
+    days, total = {}, 0
+    for r in enrich(q("SELECT * FROM requests WHERE %s AND event_date<=? AND COALESCE(return_date,event_date)>=? ORDER BY event_date,t1" % stq, last, first)):
+        if f == "__equip" and not r["its"]: continue
+        if f in FACILITIES and f.lower() not in [x.lower() for x in r["fac"]]: continue
+        rd = r["return_date"] or r["event_date"]
+        known = [x for x in r["fac"] if x in FACILITIES]
+        cls = "c%d" % FACILITIES.index(f if f in FACILITIES else known[0]) if known else ("co" if r["fac"] else "ce")
+        total += 1
+        for dd in range(int(max(r["event_date"], first)[8:10]), int(min(rd, last)[8:10]) + 1):
+            key = "%s-%02d" % (ym, dd)
+            tl = ("%s - %s" % (t12(r["t1"]), t12(r["t2"]))) if rd == r["event_date"] else ("From " + t12(r["t1"])) if key == r["event_date"] else ("Until " + t12(r["t2"])) if key == rd else "All day"
+            e = dict(id=r["id"], event=r["event"], badge=r["badge"], time=tl, res=r["res"], cls=cls, rfu=r["rfu_no"], pend=r["badge"] == "Pending",
+                     short=("%s %s" % (t12(r["t1"]), r["event"])) if key == r["event_date"] else r["event"])
+            if admin: e.update(requester=r["requester"], dept=r["dept"], pdf=url_for("request_pdf", rid=r["id"]),
+                               link=url_for("dashboard", tab="returned" if r["returned_at"] else r["status"].lower()))
+            days.setdefault(dd, []).append(e)
+    py, pm = (y - 1, 12) if mo == 1 else (y, mo - 1); ny, nm = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    ctx = dict(tab="cal", admin=admin, weeks=Calendar(6).monthdayscalendar(y, mo), days=days, ym=ym, title=date(y, mo, 1).strftime("%B %Y"), total=total,
+               prev="%04d-%02d" % (py, pm), next="%04d-%02d" % (ny, nm), f=f, s=s_, facs=FACILITIES, today=today_ph().isoformat(), page_sub="General Services Office - Booking Calendar")
+    if admin:
+        ctx["cnt"] = {k: q1(sq)[0] for k, sq in {"pending": "SELECT COUNT(*) FROM requests WHERE status='Pending'", "approved": "SELECT COUNT(*) FROM requests WHERE status='Approved' AND returned_at IS NULL",
+                      "returned": "SELECT COUNT(*) FROM requests WHERE status='Approved' AND returned_at IS NOT NULL", "disapproved": "SELECT COUNT(*) FROM requests WHERE status='Disapproved'"}.items()}
+    else:
+        sc = student_ctx("x"); ctx.update(mine=sc["mine"], notifs=sc["notifs"], unread=sc["unread"])
+    return render_template("sched.html", **ctx)
+
+_old_dash = app.view_functions["dashboard"]
+def rp_dash():
+    if request.args.get("tab") == "cal" and g.get("user"):
+        return redirect(url_for("sched_page", m=request.args.get("m")) if request.args.get("m") else url_for("sched_page"))
+    return _old_dash()
+app.view_functions["dashboard"] = rp_dash
+
+RP_CSS += """
+.sc-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}.sc-bar select,.sc-bar input{width:auto;min-width:120px}.sc-bar .btn,.sc-bar button{margin:0}.sc-bar .gap{flex:1}
+table.sc{width:100%;table-layout:fixed;border-collapse:collapse}.sc th{text-align:center;font-size:12px;padding:6px 0;color:var(--mu);border-bottom:1px solid var(--bd)}
+.sc td{border:1px solid var(--bd);height:96px;vertical-align:top;padding:3px;cursor:pointer;overflow:hidden;font-size:11px}.sc td.off{cursor:default;background:rgba(0,0,0,.03)}
+.sc td:hover:not(.off){background:rgba(20,65,123,.08)}.sc td.sel{outline:2px solid var(--pr);outline-offset:-2px}
+.dn{display:inline-block;min-width:22px;height:22px;line-height:22px;text-align:center;font-weight:600;font-size:12px;border-radius:50%}.sc td.today .dn{background:var(--pr);color:#fff}
+.sc-chip{display:block;color:#fff;border-radius:3px;padding:1px 4px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+.c0{background:#14417b}.c1{background:#2b7a47}.c2{background:#b45309}.c3{background:#7b3fa0}.ce{background:#0f766e}.co{background:#5d6779}
+.sc-chip.pend{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.3) 0 5px,transparent 5px 10px);outline:1.5px dashed rgba(0,0,0,.4);outline-offset:-1.5px}
+.sc-more{font-size:11px;color:var(--mu);display:block;margin-top:2px}.sc-leg{display:flex;flex-wrap:wrap;gap:6px 14px;margin:12px 0 0;font-size:12.5px;color:var(--mu)}
+.sc-leg i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-2px}
+.sc-ev{border-left:6px solid;padding:8px 12px;margin:8px 0;border-radius:6px;background:rgba(127,127,127,.09)}.sc-ev b{font-size:15px}.sc-ev .mu{font-size:13px}
+@media(max-width:640px){.sc td{height:58px;padding:2px}.sc-chip{font-size:0;height:7px;width:7px;border-radius:50%;display:inline-block;margin:1px;padding:0}.sc-more{font-size:10px}.dn{min-width:20px;height:20px;line-height:20px}}
+"""
+app.jinja_env.globals["RPCSS"] = RP_CSS
+
+T["sched.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'macros.html' as m %}
+{% if admin %}{{ m.side([('__label','Requests',none,''),('pending','Pending',cnt.pending,'pending'),('approved','Approved',cnt.approved,'approved'),('returned','Returned',cnt.returned,'returned'),('disapproved','Disapproved',cnt.disapproved,'disapproved'),('__label','Manage',none,''),('cal','Calendar',none,'cal'),('stock','Equipment Stock',none,'stock'),('users','Users',none,'users'),('report','Monthly Report',none,'report')], 'cal') }}
+{% else %}{{ m.side([('new','New Request',none,'new'),('mine','My Requests',mine|length,'list'),('cal','Calendar',none,'cal')], 'cal') }}{{ m.bell(notifs, unread) }}{% endif %}
+<div class="card"><h2>Booking Calendar</h2>
+<div class="sc-bar"><a class="btn s" href="{{ url_for('sched_page', m=prev, f=f, s=s) }}">&lsaquo; Prev</a><a class="btn s" href="{{ url_for('sched_page', f=f, s=s) }}">Today</a><a class="btn s" href="{{ url_for('sched_page', m=next, f=f, s=s) }}">Next &rsaquo;</a>
+<b style="font-size:17px;margin-left:6px">{{ title }}</b><span class="mu">&middot; {{ total }} booking{{ 's' if total != 1 }}</span></div>
+<form method="get" class="sc-bar"><input type="month" name="m" value="{{ ym }}"><select name="f"><option value="all">All facilities &amp; equipment</option>{% for x in facs %}<option value="{{ x }}" {{ 'selected' if f == x }}>{{ x }}</option>{% endfor %}<option value="__equip" {{ 'selected' if f == '__equip' }}>Equipment borrowing only</option></select>
+<select name="s"><option value="all">Approved + pending</option><option value="ap" {{ 'selected' if s == 'ap' }}>Approved only</option></select><button>Apply</button></form>
+<table class="sc"><tr>{% for d in ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] %}<th>{{ d }}</th>{% endfor %}</tr>
+{% for w in weeks %}<tr>{% for d in w %}{% if d %}{% set evs = days.get(d, []) %}<td id="d{{ d }}" class="{{ 'today' if ym ~ '-' ~ ('%02d'|format(d)) == today }}" onclick="selDay({{ d }})"><span class="dn">{{ d }}</span>
+{% for e in evs[:3] %}<span class="sc-chip {{ e.cls }} {{ 'pend' if e.pend }}" title="{{ e.event }} - {{ e.time }}">{{ e.short }}</span>{% endfor %}{% if evs|length > 3 %}<span class="sc-more">+{{ evs|length - 3 }} more</span>{% endif %}</td>{% else %}<td class="off"></td>{% endif %}{% endfor %}</tr>{% endfor %}</table>
+<div class="sc-leg">{% for x in facs %}<span><i class="c{{ loop.index0 }}"></i>{{ x }}</span>{% endfor %}<span><i class="ce"></i>Equipment only</span><span><i class="co"></i>Other facility</span><span><i style="background:#888;background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.4) 0 3px,transparent 3px 6px)"></i>Pending (striped)</span></div></div>
+<div class="card" id="scPanel"></div>
+<script id="scdata" type="application/json">{{ days|tojson }}</script>
+<script>(function(){var D=JSON.parse(document.getElementById('scdata').textContent),ym={{ ym|tojson }},today={{ today|tojson }},ADMIN={{ 'true' if admin else 'false' }},
+COL={c0:'#14417b',c1:'#2b7a47',c2:'#b45309',c3:'#7b3fa0',ce:'#0f766e',co:'#5d6779'},sel=null;
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+window.selDay=function(d){var el=document.getElementById('d'+d);if(!el)return;if(sel)sel.classList.remove('sel');el.classList.add('sel');sel=el;
+ var dt=new Date(ym+'-'+('0'+d).slice(-2)+'T00:00:00'),ev=D[d]||[],h='<h2>'+esc(dt.toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'}))+'</h2>';
+ if(!ev.length)h+='<p class="mu" style="font-size:14px">Nothing is booked on this day with the current filter - it looks free.</p>';
+ ev.forEach(function(e){h+='<div class="sc-ev" style="border-color:'+COL[e.cls]+'"><b>'+esc(e.event)+'</b> <span class="b '+esc(e.badge)+'">'+esc(e.badge)+'</span><br><span class="mu">'+esc(e.time)+' &middot; '+esc(e.res)+'</span>';
+  if(ADMIN)h+='<br><span class="mu">'+esc(e.requester)+' ('+esc(e.dept)+') &middot; RFU '+esc(e.rfu)+'</span><br><a href="'+esc(e.pdf)+'">PDF form</a> &middot; <a href="'+esc(e.link)+'">View in list</a>';
+  h+='</div>'});
+ document.getElementById('scPanel').innerHTML=h};
+var t=today.slice(0,7)===ym?parseInt(today.slice(8),10):1;selDay(t)})()</script>{% endblock %}"""
+
 
 rp_init()
 
