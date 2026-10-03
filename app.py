@@ -1031,6 +1031,396 @@ app.jinja_env.globals["ICONS"] = ICONS
 
 init_db()
 
+# =====================================================================================================================
+# ADDED MODULE - ONLINE DAMAGE-REPORT SYSTEM (everything below is new; nothing above this line was changed)
+#   Public (no login):  small "Report broken equipment" button on the sign-in page ->
+#                       /report      report form        /report/done   confirmation        /report/track   check status
+#   GSO admin:          /gso         separate Damage Reports dashboard (same admin account as the facility dashboard)
+#   Optional e-mail alerts: set GSO_NOTIFY_EMAIL (+ SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, APP_URL)
+# =====================================================================================================================
+import smtplib, threading
+from email.message import EmailMessage
+
+RP_STATUSES = ("New", "In Progress", "Resolved", "Rejected")
+RP_WHERE = {"new": "status='New'", "progress": "status='In Progress'", "resolved": "status='Resolved'",
+            "rejected": "status='Rejected'", "all": "1=1"}
+RP_TITLES = {"new": "New reports", "progress": "In progress", "resolved": "Resolved reports", "rejected": "Rejected / closed reports",
+             "all": "All reports", "summary": "Summary"}
+RP_PROBLEMS = ["Broken / damaged", "Not working", "Missing parts", "Leaking / electrical / safety hazard", "Other"]
+RP_COMMON = ["Chair", "Table", "Projector", "Microphone", "Sound system", "Aircon", "Electric fan", "Computer", "Light / bulb",
+             "Door / lock", "Window", "Faucet / plumbing", "Whiteboard", "Extension cord"]
+RP_MAX_PHOTO = 4 * 1024 * 1024
+RP_COLS = ("id,ticket,token,reporter,contact,dept,item,location,problem,urgent,description,photo_type,status,created_at,"
+           "updated_at,resolved_at,(photo IS NOT NULL) AS has_photo")
+RP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS damage_reports(id INTEGER PRIMARY KEY, ticket TEXT, token TEXT UNIQUE NOT NULL, reporter TEXT NOT NULL,
+  contact TEXT, dept TEXT, item TEXT NOT NULL, location TEXT NOT NULL, problem TEXT, urgent INTEGER DEFAULT 0, description TEXT NOT NULL,
+  photo TEXT, photo_type TEXT, status TEXT DEFAULT 'New', created_at TEXT, updated_at TEXT, resolved_at TEXT);
+CREATE TABLE IF NOT EXISTS damage_updates(id INTEGER PRIMARY KEY, report_id INTEGER NOT NULL REFERENCES damage_reports(id) ON DELETE CASCADE,
+  status TEXT, note TEXT, public INTEGER DEFAULT 1, by_name TEXT, created_at TEXT);
+"""
+
+def rp_init():
+    with app.app_context():
+        try:
+            if USE_PG:
+                cur = db().c.cursor(); cur.execute("SELECT pg_advisory_xact_lock(7242027)")
+                cur.execute(RP_SCHEMA.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY")
+                            + "".join("ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n" % t for t in ("damage_reports", "damage_updates")))
+                db().commit()
+            else:
+                db().executescript(RP_SCHEMA)
+        except Exception as err:
+            if USE_PG:
+                try: db().c.rollback()
+                except Exception: pass
+            print("rp_init note (another worker may have done this already):", err)
+
+ICONS.update({
+ "alert": '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+ "search": '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+})
+
+# ---- small helpers -------------------------------------------------------------------------------------------------
+RP_HITS = {}
+def rp_ip():
+    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "?")
+
+def rp_limited(bucket, limit, window=600):
+    """Soft anti-spam limit per visitor address (the form has no login)."""
+    if len(RP_HITS) > 5000: RP_HITS.clear()
+    key, now = (bucket, rp_ip()), time.time()
+    hits = [t for t in RP_HITS.get(key, []) if now - t < window]
+    if len(hits) >= limit:
+        RP_HITS[key] = hits; return True
+    hits.append(now); RP_HITS[key] = hits; return False
+
+def rp_photo(file):
+    """-> (base64 text, mime type, error). Only real JPG / PNG / WebP files are accepted (checked by file signature)."""
+    if not file or not file.filename: return None, None, None
+    raw = file.read(RP_MAX_PHOTO + 1)
+    if not raw: return None, None, None
+    if len(raw) > RP_MAX_PHOTO: return None, None, "The photo is too large (maximum 4 MB). Choose a smaller photo."
+    if raw[:3] == b"\xff\xd8\xff": mt = "image/jpeg"
+    elif raw[:8] == b"\x89PNG\r\n\x1a\n": mt = "image/png"
+    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP": mt = "image/webp"
+    else: return None, None, "The photo must be a JPG, PNG or WebP image."
+    return base64.b64encode(raw).decode(), mt, None
+
+def rp_find(code):
+    code = (code or "").strip().upper()
+    ticket, _, tok = code.rpartition("-")
+    if code.count("-") < 3 or not tok: return None
+    return q1("SELECT %s FROM damage_reports WHERE ticket=? AND token=?" % RP_COLS, ticket, tok)
+
+def rp_code(r): return "%s-%s" % (r["ticket"], r["token"])
+def rp_counts(): return {k: q1("SELECT COUNT(*) FROM damage_reports WHERE " + w)[0] for k, w in RP_WHERE.items()}
+
+_RP_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+def rp_mail(to, subject, body):
+    """Optional e-mail (only when SMTP_HOST is set). Runs in the background and never breaks the page if it fails."""
+    host = os.environ.get("SMTP_HOST", "").strip()
+    to = [t for t in to if t and _RP_EMAIL.match(t)]
+    if not host or not to: return
+    def run():
+        try:
+            m = EmailMessage(); m["Subject"] = re.sub(r"\s+", " ", subject)[:200]; m["To"] = ", ".join(to)
+            m["From"] = os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER") or "gso@localhost"; m.set_content(body)
+            port = int(os.environ.get("SMTP_PORT", "587"))
+            s = smtplib.SMTP_SSL(host, port, timeout=15) if port == 465 else smtplib.SMTP(host, port, timeout=15)
+            with s:
+                if port != 465: s.starttls()
+                if os.environ.get("SMTP_USER"): s.login(os.environ["SMTP_USER"], os.environ.get("SMTP_PASS", ""))
+                s.send_message(m)
+        except Exception as err:
+            print("rp_mail failed:", err)
+    threading.Thread(target=run, daemon=True).start()
+
+def rp_link(path): return (os.environ.get("APP_URL", "").rstrip("/") + path) if os.environ.get("APP_URL") else ""
+
+def rp_csv(x):
+    x = "" if x is None else str(x)
+    return "'" + x if x[:1] in ("=", "+", "-", "@") else x      # stops spreadsheet formula injection from public input
+
+# ---- public: report form -------------------------------------------------------------------------------------------
+@app.route("/report", methods=["GET", "POST"])
+def rp_form():
+    v, e = {"problem": RP_PROBLEMS[0]}, {}
+    if request.method == "POST":
+        v = {k: request.form.get(k, "").strip() for k in ("reporter", "contact", "dept", "item", "location", "problem", "description", "urgent", "website")}
+        if v["website"]: return redirect(url_for("home"))                       # hidden field: only bots fill it in
+        for k, label in (("reporter", "Your name"), ("contact", "Contact number or e-mail"), ("item", "Equipment / item"),
+                         ("location", "Location (building / room)"), ("description", "Description of the problem")):
+            if not v[k]: bad(e, k, label + " is required.")
+        if v["description"] and len(v["description"]) < 10: bad(e, "description", "Please describe the problem in a few more words.")
+        if v["problem"] not in RP_PROBLEMS: v["problem"] = RP_PROBLEMS[0]
+        photo, ptype, perr = rp_photo(request.files.get("photo"))
+        if perr: bad(e, "photo", perr)
+        if e: bad(e, "form", "Please fix the highlighted items. If you attached a photo, please attach it again.")
+        elif rp_limited("submit", 15): bad(e, "form", "Too many reports were sent from this network in a short time. Please wait a few minutes and try again.")
+        else:
+            tok = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6)); n = now_s()
+            ex("""INSERT INTO damage_reports(token,reporter,contact,dept,item,location,problem,urgent,description,photo,photo_type,status,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,'New',?,?)""", tok, v["reporter"][:120], v["contact"][:120], v["dept"][:120], v["item"][:80],
+               v["location"][:120], v["problem"], 1 if v["urgent"] else 0, v["description"][:1500], photo, ptype, n, n)
+            rid = q1("SELECT id FROM damage_reports WHERE token=?", tok)["id"]
+            ex("UPDATE damage_reports SET ticket=? WHERE id=?", "DR-%d-%04d" % (today_ph().year, rid), rid)
+            ex("INSERT INTO damage_updates(report_id,status,note,public,by_name,created_at) VALUES(?,?,?,?,?,?)", rid, "New", "Report received by the GSO system.", 1, "System", n)
+            rep = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+            rp_mail([x.strip() for x in os.environ.get("GSO_NOTIFY_EMAIL", "").split(",")],
+                    "%sNew damage report %s - %s" % ("[URGENT] " if rep["urgent"] else "", rep["ticket"], rep["item"]),
+                    "A new damage report was submitted.\n\nTicket: %s\nItem: %s\nLocation: %s\nProblem: %s\nUrgent: %s\nReported by: %s (%s)\n\n%s\n\n%s"
+                    % (rep["ticket"], rep["item"], rep["location"], rep["problem"], "YES" if rep["urgent"] else "no", rep["reporter"], rep["contact"],
+                       rep["description"], rp_link("/gso/report/%d" % rid)))
+            return redirect(url_for("rp_done", c=rp_code(rep)))
+    items = sorted({r["name"] for r in q("SELECT name FROM inventory")} | set(RP_COMMON), key=str.lower)
+    return render_template("rp_form.html", v=v, e=e, items=items, problems=RP_PROBLEMS, page_sub="General Services Office - Report Broken Equipment")
+
+@app.route("/report/done")
+def rp_done():
+    rep = rp_find(request.args.get("c", ""))
+    if not rep: return redirect(url_for("rp_form"))
+    return render_template("rp_done.html", rep=rep, code=rp_code(rep), page_sub="General Services Office - Report Broken Equipment")
+
+@app.route("/report/track")
+def rp_track():
+    code, rep, ups, err = request.args.get("code", "").strip(), None, [], ""
+    if code:
+        if rp_limited("track", 30): err = "Too many attempts. Please wait a few minutes and try again."
+        else:
+            rep = rp_find(code)
+            if not rep: err = "No report found with that tracking code. Please check the code and try again."
+            else: ups = q("SELECT * FROM damage_updates WHERE report_id=? AND public=1 ORDER BY id DESC", rep["id"])
+    return render_template("rp_track.html", code=code, rep=rep, ups=ups, err=err, page_sub="General Services Office - Report Broken Equipment")
+
+# ---- GSO admin: separate Damage Reports dashboard ------------------------------------------------------------------
+def rp_summary():
+    ds = []
+    for r in q("SELECT created_at, resolved_at FROM damage_reports WHERE status='Resolved' AND resolved_at IS NOT NULL"):
+        try: ds.append((datetime.strptime(r["resolved_at"], "%Y-%m-%d %H:%M") - datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M")).total_seconds() / 86400)
+        except Exception: pass
+    top = lambda col: [(r[1], r[2]) for r in q("SELECT LOWER(%s) k, MIN(%s) n, COUNT(*) c FROM damage_reports WHERE status!='Rejected' GROUP BY LOWER(%s) ORDER BY c DESC LIMIT 8" % (col, col, col))]
+    return dict(urgent_open=q1("SELECT COUNT(*) FROM damage_reports WHERE urgent=1 AND status IN ('New','In Progress')")[0],
+                avg_days=round(sum(ds) / len(ds), 1) if ds else None, top_items=top("item"), top_locs=top("location"),
+                months=[(r[0], r[1]) for r in q("SELECT SUBSTR(created_at,1,7) m, COUNT(*) c FROM damage_reports GROUP BY SUBSTR(created_at,1,7) ORDER BY m DESC LIMIT 6")])
+
+@app.route("/gso")
+@admin_required
+def gso_dash():
+    tab = request.args.get("tab", "new")
+    if tab != "summary" and tab not in RP_WHERE: tab = "new"
+    ctx = dict(tab=tab, cnt=rp_counts(), title=RP_TITLES[tab], qs="", page_sub="General Services Office - Damage Reports")
+    if tab == "summary": ctx.update(rp_summary())
+    else:
+        qs = request.args.get("qs", "").strip()[:60]; sql = "SELECT %s FROM damage_reports WHERE %s" % (RP_COLS, RP_WHERE[tab]); args = []
+        if qs:
+            sql += " AND (LOWER(ticket) LIKE ? OR LOWER(item) LIKE ? OR LOWER(location) LIKE ? OR LOWER(reporter) LIKE ? OR LOWER(description) LIKE ?)"
+            args = ["%" + qs.lower() + "%"] * 5
+        sql += " ORDER BY urgent DESC, id DESC" if tab in ("new", "progress") else " ORDER BY id DESC"
+        ctx.update(rows=q(sql, *args), qs=qs)
+    return render_template("gso_dash.html", **ctx)
+
+@app.route("/gso/report/<int:rid>")
+@admin_required
+def gso_view(rid):
+    r = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+    if not r: abort(404)
+    return render_template("gso_view.html", r=r, ups=q("SELECT * FROM damage_updates WHERE report_id=? ORDER BY id DESC", rid), statuses=RP_STATUSES,
+                           cnt=rp_counts(), tab="", page_sub="General Services Office - Damage Reports")
+
+@app.route("/gso/report/<int:rid>/update", methods=["POST"])
+@admin_required
+def gso_update(rid):
+    r = q1("SELECT %s FROM damage_reports WHERE id=?" % RP_COLS, rid)
+    if not r: abort(404)
+    st, note = request.form.get("status", r["status"]), request.form.get("note", "").strip()[:600]
+    public = 1 if request.form.get("public") else 0
+    if st not in RP_STATUSES: abort(400)
+    if st == r["status"] and not note: flash("Nothing to update. Change the status or write a note.", "err"); return redirect(url_for("gso_view", rid=rid))
+    if st == "Rejected" and not note: flash("Please write a reason in the note when rejecting a report.", "err"); return redirect(url_for("gso_view", rid=rid))
+    n = now_s(); done = (r["resolved_at"] if r["status"] == "Resolved" and r["resolved_at"] else n) if st == "Resolved" else None
+    ex("UPDATE damage_reports SET status=?, updated_at=?, resolved_at=? WHERE id=?", st, n, done, rid)
+    ex("INSERT INTO damage_updates(report_id,status,note,public,by_name,created_at) VALUES(?,?,?,?,?,?)", rid, st, note, public, g.user["fullname"], n)
+    if public:
+        rp_mail([r["contact"]], "Update on your damage report %s" % r["ticket"],
+                "Hello %s,\n\nYour report %s (%s) is now: %s\n%s\n\nTrack it any time with this code: %s\n%s\n\n- General Services Office"
+                % (r["reporter"], r["ticket"], r["item"], st, ("Note from GSO: " + note) if note else "", rp_code(r), rp_link("/report/track?code=" + rp_code(r))))
+    flash("Report %s updated." % r["ticket"], "ok")
+    return redirect(url_for("gso_view", rid=rid))
+
+@app.route("/gso/report/<int:rid>/delete", methods=["POST"])
+@admin_required
+def gso_delete(rid):
+    r = q1("SELECT ticket FROM damage_reports WHERE id=?", rid)
+    if not r: abort(404)
+    ex("DELETE FROM damage_updates WHERE report_id=?", rid); ex("DELETE FROM damage_reports WHERE id=?", rid)
+    flash("Report %s was deleted." % r["ticket"], "ok")
+    return redirect(url_for("gso_dash", tab="all"))
+
+@app.route("/gso/photo/<int:rid>")
+@admin_required
+def gso_photo(rid):
+    r = q1("SELECT photo, photo_type FROM damage_reports WHERE id=?", rid)
+    if not r or not r["photo"] or r["photo_type"] not in ("image/jpeg", "image/png", "image/webp"): abort(404)
+    return Response(base64.b64decode(r["photo"]), mimetype=r["photo_type"], headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"})
+
+@app.route("/gso/api/count")
+@admin_required
+def gso_count():
+    return jsonify(new=q1("SELECT COUNT(*) FROM damage_reports WHERE status='New'")[0])
+
+@app.route("/gso/export.csv")
+@admin_required
+def gso_export():
+    out = io.StringIO(); w = csv.writer(out)
+    w.writerow(["Ticket", "Date filed", "Status", "Urgent", "Item", "Problem", "Location", "Description", "Reporter", "Contact", "College/Office", "Resolved on"])
+    for r in q("SELECT %s FROM damage_reports ORDER BY id" % RP_COLS):
+        w.writerow([rp_csv(x) for x in (r["ticket"], r["created_at"], r["status"], "Yes" if r["urgent"] else "", r["item"], r["problem"], r["location"],
+                                        r["description"], r["reporter"], r["contact"], r["dept"], r["resolved_at"])])
+    return Response("﻿" + out.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=damage-reports.csv"})
+
+# Small "Report broken equipment" button, top-right under the header, on the sign-in page only (login page code is not edited).
+@app.after_request
+def rp_login_button(resp):
+    try:
+        if request.endpoint == "login" and resp.status_code == 200 and resp.mimetype == "text/html":
+            btn = ('<div style="text-align:right;padding:10px clamp(8px,2vw,22px) 0"><a href="%s" style="display:inline-block;background:#b45309;color:#fff;'
+                   'padding:6px 14px;border-radius:18px;font:600 13px system-ui,sans-serif;text-decoration:none;box-shadow:0 3px 10px rgba(0,0,0,.25)">'
+                   '&#9888; Report broken equipment</a></div>' % url_for("rp_form"))
+            resp.set_data(resp.get_data(as_text=True).replace("</header>", "</header>" + btn, 1))
+    except Exception:
+        pass
+    return resp
+
+# Small "Damage Reports" shortcut shown ONLY to the admin on the facility dashboard (so new reports are noticed). The old page code is not edited.
+@app.after_request
+def rp_switch_pill(resp):
+    try:
+        if request.endpoint == "dashboard" and g.get("user") and g.user["role"] == "admin" and resp.status_code == 200 and resp.mimetype == "text/html":
+            n = q1("SELECT COUNT(*) FROM damage_reports WHERE status='New'")[0]
+            pill = ('<a href="%s" style="position:fixed;right:14px;bottom:18px;z-index:30;background:#b45309;color:#fff;padding:10px 16px;border-radius:24px;'
+                    'font:600 14px system-ui,sans-serif;text-decoration:none;box-shadow:0 6px 18px rgba(0,0,0,.3)">Damage Reports%s &rarr;</a>'
+                    % (url_for("gso_dash"), (' <span style="background:#fff;color:#b45309;border-radius:10px;padding:1px 8px;margin-left:4px">%d new</span>' % n) if n else ""))
+            resp.set_data(resp.get_data(as_text=True).replace("</body>", pill + "</body>", 1))
+    except Exception:
+        pass
+    return resp
+
+# ---- templates + styling for the new pages --------------------------------------------------------------------------
+_b = T["base.html"]          # lets the new pages set their own browser-tab title / header subtitle / background; old pages render exactly as before
+_b = _b.replace("<title>Facility &amp; Equipment Request - SLSU</title>", "<title>{{ page_title|default('Facility &amp; Equipment Request - SLSU')|safe }}</title>")
+_b = _b.replace("<small>General Services Office - Facility &amp; Equipment Request</small>", "<small>{{ page_sub|default('General Services Office - Facility &amp; Equipment Request')|safe }}</small>")
+_b = _b.replace("'authbg' if request.endpoint in ('login',", "'authbg' if request.endpoint in ('rp_form', 'rp_done', 'rp_track', 'login',")
+_b = _b.replace("'dash' if request.endpoint in (", "'dash' if (request.endpoint or '').startswith('gso_') or request.endpoint in (")
+T["base.html"] = _b
+
+RP_CSS = """
+.rp-choices{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}@media(max-width:700px){.rp-choices{grid-template-columns:1fr}}
+.rp-choice{display:flex;flex-direction:column;gap:10px;padding:28px 24px;text-decoration:none;color:var(--tx);border-radius:16px;background:rgba(255,255,255,.95);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.08);transition:transform .2s ease,box-shadow .2s ease}
+.rp-choice:hover{transform:translateY(-4px);box-shadow:0 14px 30px rgba(20,83,45,.22);opacity:1}
+.rp-ic{width:54px;height:54px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#2d6a4f,#14532d);color:#fff}.rp-ic.warn{background:linear-gradient(135deg,#e0a526,#b45309)}
+.rp-ic svg{width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.rp-choice b{font:600 20px Georgia,serif;color:var(--pr)}.rp-choice .d{color:var(--mu);font-size:14px}.rp-go{margin-top:auto;font-weight:700;color:var(--pr);padding-top:6px}
+.rp-narrow{max-width:640px;margin-left:auto;margin-right:auto}
+textarea{width:100%;padding:9px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx);font:inherit;min-height:96px;resize:vertical}
+.auth textarea{padding:12px 13px;font-size:16px}textarea:focus{outline:none;border-color:var(--pr);box-shadow:0 0 0 3px rgba(20,65,123,.22)}
+.rp-urg{background:#a63232;color:#fff;border-radius:12px;padding:1px 8px;font-size:11px;font-weight:700;margin-left:4px;white-space:nowrap}
+.b.New{background:#fde8c8;color:#8a4b00}.b.InProgress{background:#dbe7fb;color:#14417b}.b.Resolved{background:#d5f0de;color:#1e6b3a}.b.Rejected{background:#e6e8ec;color:#4a5160}
+.rp-code{font:700 26px/1.2 ui-monospace,Consolas,monospace;letter-spacing:1px;background:#eef6f0;border:2px dashed #2d6a4f;border-radius:10px;padding:14px;text-align:center;margin:14px 0;word-break:break-all;user-select:all}
+.rp-dl{display:grid;grid-template-columns:130px 1fr;gap:8px 14px;margin:0}.rp-dl dt{color:var(--mu);font-size:13px}.rp-dl dd{margin:0;word-break:break-word}
+@media(max-width:560px){.rp-dl{grid-template-columns:1fr;gap:1px}.rp-dl dt{margin-top:8px}}
+.rp-2{display:grid;grid-template-columns:1.2fr 1fr;gap:18px;align-items:start}@media(max-width:820px){.rp-2{grid-template-columns:1fr}}
+.rp-tl{list-style:none;margin:0;padding:0}.rp-tl li{border-left:3px solid #95d5b2;padding:2px 0 12px 12px;margin-left:4px}.rp-tl small{color:var(--mu);display:block}
+.rp-photo{max-width:100%;max-height:340px;border-radius:8px;border:1px solid var(--bd);display:block;margin-top:6px}
+.rp-bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}.rp-bar input{flex:1;min-width:180px;width:auto}.rp-bar button,.rp-bar .btn{margin:0}
+"""
+app.jinja_env.globals["RPCSS"] = RP_CSS
+
+T["rp_base.html"] = """{% extends 'base.html' %}{% block body %}<style>{{ RPCSS|safe }}</style>{% block rp %}{% endblock %}{% endblock %}"""
+
+T["rp_macros.html"] = """
+{% macro ico(n) %}<svg viewBox="0 0 24 24" aria-hidden="true">{{ ICONS[n]|safe }}</svg>{% endmacro %}
+{% macro gside(tab, cnt) %}<button type="button" class="menubtn" onclick="menu(true)" aria-label="Open menu">{{ ico('menu') }}</button><div id="sideBg" class="sideBg" onclick="menu(false)"></div>
+<nav id="side" class="side"><div class="sideuser"><div class="av">{{ (g.user.fullname or '?')[:1]|upper }}</div><div class="who2"><b>{{ g.user.fullname }}</b><span>Damage Reports</span></div><button type="button" class="x" onclick="menu(false)" aria-label="Close menu">{{ ico('x') }}</button></div>
+<div class="navlabel" style="--i:1">Damage reports</div>
+{% for k, label, n, ic in [('new','New',cnt['new'],'bell'),('progress','In Progress',cnt['progress'],'pending'),('resolved','Resolved',cnt['resolved'],'approved'),('rejected','Rejected',cnt['rejected'],'disapproved'),('all','All reports',cnt['all'],'list'),('summary','Summary',none,'report')] %}
+<a class="nav {{ 'on' if tab == k }}" style="--i:{{ loop.index + 1 }}" href="{{ url_for('gso_dash', tab=k) }}">{{ ico(ic) }}<span>{{ label }}</span>{% if n is not none %}<span class="cnt" {% if k == 'new' %}id="gsoNew"{% endif %}>{{ n }}</span>{% endif %}</a>{% endfor %}
+<div class="navlabel" style="--i:8">Other system</div>
+<a class="nav" style="--i:9" href="{{ url_for('dashboard') }}">{{ ico('stock') }}<span>Facility &amp; Equipment</span></a>
+<div class="foot"><a class="nav" href="{{ url_for('account') }}">{{ ico('lock') }}<span>Change password</span></a><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="signout">{{ ico('out') }}<span>Sign out</span></button></form></div></nav>
+<script>(function(){var last={{ cnt['new'] }};setInterval(function(){fetch('/gso/api/count',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){
+ var el=document.getElementById('gsoNew');if(el)el.textContent=d['new'];
+ if(d['new']>last&&!document.getElementById('gsoAlert')){var a=document.createElement('div');a.id='gsoAlert';a.className='msg ok';a.innerHTML='A new damage report was received. <a href="/gso?tab=new">View new reports</a>';var w=document.querySelector('.wrap');w.insertBefore(a,w.firstChild)}
+ last=d['new']}).catch(function(){})},45000)})()</script>{% endmacro %}
+{% macro badge(s) %}<span class="b {{ s|replace(' ', '') }}">{{ s }}</span>{% endmacro %}
+"""
+
+T["rp_form.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'macros.html' as m %}
+<form class="card auth rp-narrow" method="post" enctype="multipart/form-data" onsubmit="var b=this.querySelector('button.sub');setTimeout(function(){b.disabled=true},0)">{{ m.token() }}
+<h2 style="font-size:22px">Report Broken / Damaged Equipment</h2>
+<p class="mu" style="font-size:14px">No account needed. Fields marked * are required. The GSO will receive your report right away.</p>
+{% if e.get('form') %}<div class="msg err">{{ e['form'][0] }}</div>{% endif %}
+<div style="position:absolute;left:-9999px" aria-hidden="true"><label>Website<input name="website" tabindex="-1" autocomplete="off"></label></div>
+<label>Equipment / item *</label><input name="item" list="rp-items" maxlength="80" value="{{ v.get('item','') }}" placeholder="e.g. Projector, Chair, Aircon" required><datalist id="rp-items">{% for i in items %}<option value="{{ i }}">{% endfor %}</datalist>{{ m.fe(e,'item') }}
+<label>Location (building / room) *</label><input name="location" maxlength="120" value="{{ v.get('location','') }}" placeholder="e.g. Admin Building, Room 203" required>{{ m.fe(e,'location') }}
+<label>What is wrong? *</label><select name="problem">{% for p in problems %}<option {{ 'selected' if v.get('problem') == p }}>{{ p }}</option>{% endfor %}</select>
+<label>Describe the problem *</label><textarea name="description" maxlength="1500" placeholder="What happened? Since when? Is it still usable?" required>{{ v.get('description','') }}</textarea>{{ m.fe(e,'description') }}
+<div class="ck" style="margin-top:10px"><label><input type="checkbox" name="urgent" value="1" {{ 'checked' if v.get('urgent') }}> This is urgent / a safety hazard (exposed wires, leaking, could hurt someone)</label></div>
+<label>Photo (optional)</label><input type="file" name="photo" id="rpPhoto" accept="image/*">{{ m.fe(e,'photo') }}<img id="rpPrev" class="rp-photo" alt="" style="display:none">
+<label>Your name *</label><input name="reporter" maxlength="120" value="{{ v.get('reporter','') }}" required>{{ m.fe(e,'reporter') }}
+<label>Contact number or e-mail *</label><input name="contact" maxlength="120" value="{{ v.get('contact','') }}" placeholder="So the GSO can reach you" required>{{ m.fe(e,'contact') }}
+<label>College / Office (optional)</label><input name="dept" maxlength="120" value="{{ v.get('dept','') }}">
+<button class="sub">Submit report</button><a class="btn s" href="{{ url_for('home') }}">Cancel</a></form>
+<script>(function(){var f=document.getElementById('rpPhoto'),pv=document.getElementById('rpPrev');if(!f)return;
+f.addEventListener('change',function(){var file=f.files[0];pv.style.display='none';if(!file||!/^image\\/(jpeg|png|webp)$/.test(file.type))return;
+ var u=URL.createObjectURL(file),img=new Image();img.onload=function(){pv.src=u;pv.style.display='block';
+  if(!window.DataTransfer)return;var s=Math.min(1,1280/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=Math.round(img.width*s);c.height=Math.round(img.height*s);
+  c.getContext('2d').drawImage(img,0,0,c.width,c.height);c.toBlob(function(b){if(!b)return;try{var dt=new DataTransfer();dt.items.add(new File([b],'photo.jpg',{type:'image/jpeg'}));f.files=dt.files}catch(x){}},'image/jpeg',.82)};img.src=u})})()</script>{% endblock %}"""
+
+T["rp_done.html"] = """{% extends 'rp_base.html' %}{% block rp %}
+<div class="card rp-narrow" style="text-align:center"><h2 style="font-size:24px">Report submitted &#10003;</h2>
+<p>Thank you! The General Services Office has received your report for <b>{{ rep.item }}</b>.</p>
+<p class="mu" style="font-size:14px;margin-bottom:0">Save this tracking code. You can use it to check the status of your report:</p><div class="rp-code">{{ code }}</div>
+<a class="btn" href="{{ url_for('rp_track', code=code) }}">Check status</a><a class="btn s" href="{{ url_for('rp_form') }}">Report another</a><a class="btn s" href="{{ url_for('home') }}">Back to sign in</a></div>{% endblock %}"""
+
+T["rp_track.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}
+<div class="card rp-narrow"><h2>Check my report</h2><form method="get" class="rp-bar"><input name="code" value="{{ code }}" placeholder="Tracking code, e.g. DR-2026-0007-K4X9Q2" required><button>Check</button></form>
+{% if err %}<div class="msg err" style="margin:0">{{ err }}</div>{% endif %}
+{% if rep %}<hr style="border:0;border-top:1px solid var(--bd);margin:14px 0"><p style="margin:0 0 6px"><b>{{ rep.ticket }}</b> &middot; {{ rm.badge(rep.status) }}{% if rep.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</p>
+<dl class="rp-dl"><dt>Item</dt><dd>{{ rep.item }}</dd><dt>Location</dt><dd>{{ rep.location }}</dd><dt>Problem</dt><dd>{{ rep.problem }}</dd><dt>Date filed</dt><dd>{{ rep.created_at|dt12 }}</dd><dt>Last update</dt><dd>{{ rep.updated_at|dt12 }}</dd></dl>
+<h4 style="margin:18px 0 8px">Progress</h4><ul class="rp-tl">{% for u in ups %}<li>{{ rm.badge(u.status) }} {% if u.note %}{{ u.note }}{% endif %}<small>{{ u.created_at|dt12 }}</small></li>{% endfor %}</ul>{% endif %}
+<a class="btn s" href="{{ url_for('home') }}">Back to sign in</a></div>{% endblock %}"""
+
+T["gso_dash.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{{ rm.gside(tab, cnt) }}
+{% if tab == 'summary' %}<div class="card"><h2>Damage Reports - Summary</h2>
+<div class="stats"><div class="stat"><b>{{ cnt['all'] }}</b><span>Total reports</span></div><div class="stat"><b>{{ cnt['new'] }}</b><span>New</span></div><div class="stat"><b>{{ cnt['progress'] }}</b><span>In progress</span></div><div class="stat"><b>{{ cnt['resolved'] }}</b><span>Resolved</span></div><div class="stat"><b>{{ urgent_open }}</b><span>Urgent &amp; still open</span></div><div class="stat"><b>{{ avg_days if avg_days is not none else '-' }}</b><span>Avg. days to resolve</span></div></div>
+<div class="rp-2"><div><h4>Most reported items</h4><table>{% for n, c in top_items %}<tr><td>{{ n }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div>
+<div><h4>Locations with most reports</h4><table>{% for n, c in top_locs %}<tr><td>{{ n }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table></div></div>
+<h4>Reports per month (last 6)</h4><table>{% for mo, c in months %}<tr><td>{{ mo }}</td><td style="text-align:right">{{ c }}</td></tr>{% else %}<tr><td class="mu">-</td></tr>{% endfor %}</table>
+<a class="btn" href="{{ url_for('gso_export') }}">Download CSV (Excel)</a></div>
+{% else %}<div class="card"><h2>{{ title }}</h2>
+{% if tab == 'new' %}<p class="mu">New reports from the public form appear here (urgent ones first). Open a report to acknowledge it, update its status and leave a note for the reporter.</p>{% endif %}
+<form method="get" class="rp-bar"><input type="hidden" name="tab" value="{{ tab }}"><input name="qs" value="{{ qs }}" placeholder="Search ticket, item, location, reporter"><button>Search</button>{% if qs %}<a class="btn s" href="{{ url_for('gso_dash', tab=tab) }}">Clear</a>{% endif %}</form>
+<div class="tb"><table><tr><th>Ticket</th><th>Item / problem</th><th>Location</th><th>Reported by</th><th>Filed</th><th>Status</th><th></th></tr>
+{% for x in rows %}<tr><td><a href="{{ url_for('gso_view', rid=x.id) }}">{{ x.ticket }}</a>{% if x.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</td><td><b>{{ x.item }}</b><br><span class="mu">{{ x.problem }}</span></td><td>{{ x.location }}</td><td>{{ x.reporter }}<br><span class="mu">{{ x.contact }}</span></td><td>{{ x.created_at|dt12 }}</td><td>{{ rm.badge(x.status) }}</td><td><a class="btn sm" href="{{ url_for('gso_view', rid=x.id) }}">Open</a></td></tr>
+{% else %}<tr><td colspan="7">No reports here.</td></tr>{% endfor %}</table></div></div>{% endif %}{% endblock %}"""
+
+T["gso_view.html"] = """{% extends 'rp_base.html' %}{% block rp %}{% import 'rp_macros.html' as rm %}{% import 'macros.html' as m %}{{ rm.gside(tab, cnt) }}
+<p><a href="{{ url_for('gso_dash', tab='new') }}">&lsaquo; Back to reports</a></p>
+<div class="rp-2"><div class="card"><h2>{{ r.ticket }} {% if r.urgent %}<span class="rp-urg">URGENT</span>{% endif %}</h2><p style="margin:-6px 0 12px">{{ rm.badge(r.status) }}</p>
+<dl class="rp-dl"><dt>Item</dt><dd><b>{{ r.item }}</b></dd><dt>Problem type</dt><dd>{{ r.problem }}</dd><dt>Location</dt><dd>{{ r.location }}</dd><dt>Description</dt><dd style="white-space:pre-wrap">{{ r.description }}</dd>
+<dt>Reported by</dt><dd>{{ r.reporter }}</dd><dt>Contact</dt><dd>{{ r.contact }}</dd><dt>College / Office</dt><dd>{{ r.dept or '-' }}</dd><dt>Date filed</dt><dd>{{ r.created_at|dt12 }}</dd>{% if r.resolved_at %}<dt>Resolved on</dt><dd>{{ r.resolved_at|dt12 }}</dd>{% endif %}
+<dt>Tracking code</dt><dd style="font-family:monospace">{{ r.ticket }}-{{ r.token }}</dd></dl>
+{% if r.has_photo %}<h4 style="margin:16px 0 4px">Photo</h4><a href="{{ url_for('gso_photo', rid=r.id) }}" target="_blank"><img class="rp-photo" src="{{ url_for('gso_photo', rid=r.id) }}" alt="Photo of the damaged item"></a>{% endif %}</div>
+<div><div class="card"><h2>Update this report</h2><form method="post" action="{{ url_for('gso_update', rid=r.id) }}">{{ m.token() }}
+<label>Status</label><select name="status">{% for s in statuses %}<option {{ 'selected' if s == r.status }}>{{ s }}</option>{% endfor %}</select>
+<label>Note (required when rejecting)</label><textarea name="note" maxlength="600" placeholder="e.g. Technician assigned, will fix tomorrow."></textarea>
+<div class="ck" style="margin-top:8px"><label><input type="checkbox" name="public" value="1" checked> Show this note to the reporter on the tracking page</label></div><button>Save update</button></form></div>
+<div class="card"><h2>History</h2><ul class="rp-tl">{% for u in ups %}<li>{{ rm.badge(u.status) }} {% if u.note %}{{ u.note }}{% endif %}<small>{{ u.created_at|dt12 }} &middot; {{ u.by_name }}{% if not u.public %} &middot; internal note{% endif %}</small></li>{% endfor %}</ul>
+<form method="post" action="{{ url_for('gso_delete', rid=r.id) }}" onsubmit="return confirm('Delete this report permanently? Use this only for spam or duplicates.')">{{ m.token() }}<button class="sm r">Delete report</button></form></div></div></div>{% endblock %}"""
+
+rp_init()
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reset-admin":
         with app.app_context():
