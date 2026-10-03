@@ -1571,6 +1571,21 @@ _b = _b.replace("url_for('logo', n='1')", "url_for('logo', n='1s')").replace("ur
 _b = _b.replace("</style></head>", RP_DARK + "</style>" + RP_THEME_INIT + "</head>", 1)
 _b = _b.replace("</body></html>", RP_THEME_BTN + "</body></html>", 1)
 T["base.html"] = _b
+# Definitive fixed background (all devices) — injected after all other base.html edits
+T["base.html"] = T["base.html"].replace("</style>", """
+# ===== DEFINITIVE FIXED BACKGROUND (works on ALL devices: phone/tablet/laptop/PC) =====
+html::before{content:"";position:fixed;top:0;left:0;width:100%;height:100%;z-index:-2;
+  background:url('/bg.jpg') center center / cover no-repeat;pointer-events:none}
+@media(max-width:800px){html::before{background-image:url('/bg-s.jpg')}}
+body.authbg,body.dash{background:transparent !important}
+body.authbg::before,body.dash::before{display:none !important}
+body.authbg::after,body.dash::after{content:"";position:fixed;top:0;left:0;width:100%;height:100%;z-index:-1;pointer-events:none}
+body.authbg::after{background:rgba(255,255,255,.10)}
+body.dash::after{background:rgba(255,255,255,.55)}
+html[data-theme=dark] body.authbg::after{background:rgba(8,14,20,.72)}
+html[data-theme=dark] body.dash::after{background:rgba(8,14,20,.84)}
+""", 1)
+
 
 # ---- 3. Backup & export of all data (admin) -----------------------------------------------------------------------
 RP_BK = [("requests", "id,rfu_no,user_id,requester,dept,event,event_date,t1,t2,return_date,attendees,facilities,head,status,remarks,created_at,returned_at", "requests"),
